@@ -1,9 +1,19 @@
 # FastAPI
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
+# Db
+from src.db.client import get_client
 
 router = APIRouter()
 
 
 @router.get( '/health' )
-def health_check():
-	return { 'status': 'ok' }
+async def health():
+
+	try:
+		client = get_client()
+		client.collection( 'health_check' ).document( 'ping' ).get()
+	except Exception as e:
+		return JSONResponse( status_code = 503, content = { 'status': 'unhealthy', 'firestore': str( e ) } )
+
+	return { 'status': 'healthy', 'firestore': 'ok' }

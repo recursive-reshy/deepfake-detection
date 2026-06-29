@@ -1,8 +1,12 @@
 # FastAPI
 from fastapi import FastAPI
 # Routes
-from api.routes.health import router as health_router
+from api.routes import health, evaluate, jobs, predict, train
 
-app = FastAPI()
+app = FastAPI( title = 'Deepfake Detection API' )
 
-app.include_router( health_router )
+app.include_router( health.router )
+app.include_router( train.router )
+app.include_router( evaluate.router )
+app.include_router( predict.router )
+app.include_router( jobs.router )
