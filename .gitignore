@@ -63,3 +63,6 @@ Thumbs.db
 
 # Claude.md
 CLAUDE.md
+
+# Setup GCP script
+scripts/setup_gcp.sh
