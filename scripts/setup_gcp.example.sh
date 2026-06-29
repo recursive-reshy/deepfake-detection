@@ -30,9 +30,8 @@ step()    { echo -e "\n${BOLD}==> $1${NC}"; }
 step "Checking prerequisites"
 
 command -v gcloud >/dev/null 2>&1 || error "gcloud CLI not found. Install from https://cloud.google.com/sdk/docs/install"
-command -v jq     >/dev/null 2>&1 || error "jq not found. Install with: brew install jq  |  apt install jq"
 
-GCLOUD_VERSION=$(gcloud version --format="value(Google Cloud SDK)" 2>/dev/null)
+GCLOUD_VERSION=$(gcloud version 2>/dev/null | head -1 || echo "unknown")
 info "gcloud SDK version: ${GCLOUD_VERSION}"
 
 # Ensure the user is authenticated
@@ -76,7 +75,7 @@ NOTIFY_EMAIL=""        # e.g. your@email.com
 # Validate required config is filled in
 [[ -z "${PROJECT_ID}"        ]] && error "PROJECT_ID is not set. Edit the configuration section of this script."
 [[ -z "${PROJECT_NAME}"      ]] && error "PROJECT_NAME is not set."
-[[ -z "${BILLING_ACCOUNT_ID}"]] && error "BILLING_ACCOUNT_ID is not set. Run: gcloud billing accounts list"
+[[ -z "${BILLING_ACCOUNT_ID}" ]] && error "BILLING_ACCOUNT_ID is not set. Run: gcloud billing accounts list"
 [[ -z "${GCS_BUCKET}"        ]] && error "GCS_BUCKET is not set."
 [[ -z "${NOTIFY_EMAIL}"      ]] && error "NOTIFY_EMAIL is not set."
 
