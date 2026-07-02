@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
 	"fastapi",
+	"google-cloud-aiplatform>=1.159.0",
 	"google-cloud-firestore",
 	"python-dotenv",
 	"python-multipart",
+	"pyyaml>=6.0.3",
 	"uvicorn",
 ]
