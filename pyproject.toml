@@ -5,10 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+	"albumentationsx>=2.3,<3.0",
 	"fastapi",
 	"google-cloud-aiplatform>=1.159.0",
 	"google-cloud-firestore",
 	"google-cloud-storage>=3.12.0",
+	"opencv-python-headless>=5.0.0.93",
 	"pandas>=2.3.3",
 	"python-dotenv",
 	"python-multipart",
