@@ -8,6 +8,7 @@ dependencies = [
 	"fastapi",
 	"google-cloud-aiplatform>=1.159.0",
 	"google-cloud-firestore",
+	"pandas>=2.3.3",
 	"python-dotenv",
 	"python-multipart",
 	"pyyaml>=6.0.3",
