@@ -13,5 +13,6 @@ dependencies = [
 	"python-dotenv",
 	"python-multipart",
 	"pyyaml>=6.0.3",
+	"tensorflow>=2.21.0",
 	"uvicorn",
 ]
