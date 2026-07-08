@@ -43,3 +43,17 @@ class PredictionRecord( BaseModel ):
 	label: Literal[ 'real', 'fake' ]
 	confidence: float
 	predicted_at: datetime
+
+class BaselineResultsDocument( BaseModel ):
+	run_id: str
+	model_type: str
+
+	accuracy: float
+	auc_roc: float
+	auc_roc_positive_class: Literal[ 'REAL', 'FAKE' ]
+
+	feature_dim: int
+	feature_method: str
+
+	artifact_paths: dict[ str, str ]
+	completed_at: datetime

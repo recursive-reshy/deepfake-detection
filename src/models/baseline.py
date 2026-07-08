@@ -27,6 +27,20 @@ FEATURE_CACHE_PREFIX = 'baseline/features'
 ARTIFACT_PREFIX = 'baseline/artifacts'
 
 
+def get_artifact_uris() -> dict[ str, str ]:
+	'''
+	Single source of truth for where the trained model and fitted scaler live in GCS —
+	used by train_baseline_svm() (write), load_baseline_artifacts() (read), and 4.4's
+	Firestore document (reported as artifact_paths), so the path convention only exists
+	in one place.
+	'''
+
+	return {
+		'model': f'gs://{ config.GCS_BUCKET }/{ ARTIFACT_PREFIX }/svm_model.joblib',
+		'scaler': f'gs://{ config.GCS_BUCKET }/{ ARTIFACT_PREFIX }/scaler.joblib',
+	}
+
+
 def build_feature_matrices( splits: dict[ str, pd.DataFrame ], img_size: int ) -> dict[ str, tuple[ np.ndarray, np.ndarray ] ]:
 	'''
 	Load every image in each split (train/val/test) via image_loader.py, run it through
@@ -109,10 +123,12 @@ def train_baseline_svm( features: dict[ str, tuple[ np.ndarray, np.ndarray ] ], 
 
 	log.info( f'Baseline SVM trained on { X_train_scaled.shape[ 0 ] } samples, { X_train_scaled.shape[ 1 ] }-dim features, classes_={ list( model.classes_ ) }' )
 
-	for name, obj in ( ( 'svm_model', model ), ( 'scaler', scaler ) ):
+	artifact_uris = get_artifact_uris()
+
+	for obj, uri in ( ( model, artifact_uris[ 'model' ] ), ( scaler, artifact_uris[ 'scaler' ] ) ):
 		buffer = io.BytesIO()
 		joblib.dump( obj, buffer )
-		upload_bytes_to_blob( f'gs://{ config.GCS_BUCKET }/{ ARTIFACT_PREFIX }/{ name }.joblib', buffer.getvalue() )
+		upload_bytes_to_blob( uri, buffer.getvalue() )
 
 	return model, scaler
 
@@ -123,8 +139,10 @@ def load_baseline_artifacts() -> tuple[ SVC, StandardScaler ]:
 	in-memory buffer, no local disk touched either direction.
 	'''
 
-	model_bytes = download_blob_to_bytes( f'gs://{ config.GCS_BUCKET }/{ ARTIFACT_PREFIX }/svm_model.joblib' )
-	scaler_bytes = download_blob_to_bytes( f'gs://{ config.GCS_BUCKET }/{ ARTIFACT_PREFIX }/scaler.joblib' )
+	artifact_uris = get_artifact_uris()
+
+	model_bytes = download_blob_to_bytes( artifact_uris[ 'model' ] )
+	scaler_bytes = download_blob_to_bytes( artifact_uris[ 'scaler' ] )
 
 	model = joblib.load( io.BytesIO( model_bytes ) )
 	scaler = joblib.load( io.BytesIO( scaler_bytes ) )
@@ -149,7 +167,7 @@ def load_cached_features( split_name: str ) -> tuple[ np.ndarray, np.ndarray ]:
 	return X, y
 
 
-def evaluate_baseline_svm( model: SVC, scaler: StandardScaler, X_test: np.ndarray, y_test: np.ndarray ) -> dict[ str, float ]:
+def evaluate_baseline_svm( model: SVC, scaler: StandardScaler, X_test: np.ndarray, y_test: np.ndarray ) -> dict:
 	'''
 	Score the trained baseline SVM against a held-out split's cached features.
 
@@ -169,7 +187,10 @@ def evaluate_baseline_svm( model: SVC, scaler: StandardScaler, X_test: np.ndarra
 	orientation, since roc_auc_score can't be told to treat the negated scores as
 	pointing at 'FAKE' instead. The resulting AUC-ROC is therefore with respect to
 	detecting 'REAL', not 'FAKE' — worth carrying that framing into the report if this
-	number sits next to precision/recall computed the other way round.
+	number sits next to precision/recall computed the other way round. That positive
+	class is derived here (np.unique(y_test)[-1], the same rule roc_auc_score applies
+	internally) rather than hardcoded, and returned as 'auc_roc_positive_class' so 4.4
+	records it in Firestore instead of it needing to be re-derived later from memory.
 	predict_proba() is not used — probability=False upstream (train_baseline_svm) rules
 	it out for determinism.
 	'''
@@ -183,7 +204,12 @@ def evaluate_baseline_svm( model: SVC, scaler: StandardScaler, X_test: np.ndarra
 
 	accuracy = accuracy_score( y_test, y_pred )
 	auc_roc = roc_auc_score( y_test, model.decision_function( X_test_scaled ) )
+	auc_roc_positive_class = np.unique( y_test )[ -1 ]
 
-	log.info( f'Baseline evaluation — accuracy={ accuracy:.4f}, auc_roc={ auc_roc:.4f}' )
+	log.info( f'Baseline evaluation — accuracy={ accuracy:.4f}, auc_roc={ auc_roc:.4f}, auc_roc_positive_class={ auc_roc_positive_class }' )
 
-	return { 'accuracy': accuracy, 'auc_roc': auc_roc }
+	return {
+		'accuracy': accuracy,
+		'auc_roc': auc_roc,
+		'auc_roc_positive_class': str( auc_roc_positive_class ),
+	}
