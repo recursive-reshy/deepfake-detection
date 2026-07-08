@@ -1,3 +1,5 @@
+# Standard library
+import logging
 # TensorFlow
 import tensorflow as tf
 # NumPy
@@ -5,6 +7,7 @@ import numpy as np
 # Utils
 from src.utils.gcs import download_blob_to_bytes
 
+log = logging.getLogger( __name__ )
 
 def load_image( gcs_uri: str, img_size: int ) -> np.ndarray:
 	'''
