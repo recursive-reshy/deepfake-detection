@@ -92,10 +92,10 @@ def main() -> None:
 	try:
 		# Manifest + split
 		manifest_uri = f'gs://{ config.GCS_BUCKET }/{ experiment.dataset_path }'
-		manifest = load_manifest( manifest_uri )
+		manifest = load_manifest( manifest_uri, experiment.max_samples_per_split )
 		log.info( 'Manifest loaded', extra={ 'job_id': job_id, 'rows': len( manifest ) } )
 
-		splits, class_weights = split_dataset( manifest )
+		splits, class_weights = split_dataset( manifest, is_truncated = experiment.max_samples_per_split is not None )
 		log.info( 'Split complete', extra={
 			'job_id': job_id,
 			'class_weights': class_weights,

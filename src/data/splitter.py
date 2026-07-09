@@ -8,7 +8,7 @@ log = logging.getLogger( __name__ )
 EXPECTED_SPLIT_COUNTS = { 'train': 4593, 'val': 641, 'test': 1323 }
 
 
-def split_dataset( manifest: pd.DataFrame ) -> tuple[ dict[ str, pd.DataFrame ], dict[ str, float ] ]:
+def split_dataset( manifest: pd.DataFrame, is_truncated: bool = False ) -> tuple[ dict[ str, pd.DataFrame ], dict[ str, float ] ]:
 	'''
 	Partition the manifest DataFrame (from loader.py) by dataset_split, and compute class
 	weights from the train partition's own label distribution only — not the full dataset.
@@ -17,6 +17,11 @@ def split_dataset( manifest: pd.DataFrame ) -> tuple[ dict[ str, pd.DataFrame ],
 	the standard "balanced" heuristic (equivalent to
 	sklearn.utils.class_weight.compute_class_weight(class_weight='balanced', ...)), computed
 	by hand here rather than adding scikit-learn as a dependency before Phase 4/6 needs it.
+
+	is_truncated — set by callers when manifest came from loader.py's max_samples_per_split
+	smoke-test truncation, so the EXPECTED_SPLIT_COUNTS comparison below is skipped instead
+	of warning on every intentionally-small split. False (production default) keeps the
+	comparison active.
 
 	Returns (splits, class_weights):
 	  splits        — { 'train': df, 'val': df, 'test': df }, filtered by dataset_split with
@@ -34,7 +39,7 @@ def split_dataset( manifest: pd.DataFrame ) -> tuple[ dict[ str, pd.DataFrame ],
 
 		expected = EXPECTED_SPLIT_COUNTS[ split_name ]
 
-		if len( split_df ) != expected:
+		if not is_truncated and len( split_df ) != expected:
 			log.warning( f'Split "{ split_name }" has { len( split_df ) } rows, expected { expected }' )
 
 		splits[ split_name ] = split_df

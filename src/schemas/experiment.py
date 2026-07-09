@@ -24,3 +24,7 @@ class ExperimentConfig( BaseModel ):
 
 	dataset_ingestion: Literal[ 'presplit', 'flat', 'csv' ] = 'presplit'
 	dataset_path: str
+
+	# Smoke-test only — truncates each split to a small, class-balanced sample so Phase 5
+	# code can be validated on CPU ahead of T4 quota. Must be None in every production config.
+	max_samples_per_split: int | None = None
