@@ -2,8 +2,11 @@
 import argparse
 import logging
 import sys
+import tempfile
 # NumPy
 import numpy as np
+# TensorFlow
+import tensorflow as tf
 # Structured logging
 from pythonjsonlogger.json import JsonFormatter
 # Config
@@ -16,8 +19,14 @@ from src.data.splitter import split_dataset
 from src.data.image_loader import load_image
 from src.data.augment import augment_image
 from src.data.preprocessor import preprocess_image
+# Models
+from src.models.backbone import build_backbone
+from src.models.head import build_head
+# Training
+from src.training.callbacks import FirestoreEpochCallback
 # Utils
 from src.utils.seed import set_global_seed
+from src.utils.gcs import upload_bytes_to_blob
 
 handler = logging.StreamHandler()
 handler.setFormatter( JsonFormatter(
@@ -29,29 +38,43 @@ logging.basicConfig( level=logging.INFO, handlers=[ handler ], force=True )
 
 log = logging.getLogger( __name__ )
 
+# FAKE is the positive class (target=1) — the natural framing for a deepfake detector.
+# Nothing else in the codebase pins this for the neural-net path (baseline.py's SVM path
+# keeps raw string labels throughout, sidestepping the question); binary_crossentropy
+# needs a numeric target, so it's decided here.
+LABEL_TO_TARGET = { 'REAL': 0.0, 'FAKE': 1.0 }
 
-def build_batches( split_df, img_size: int, patch_grid_size: int, batch_size: int, augment: bool, shuffle: bool ):
+
+def build_batches( split_df, img_size: int, patch_grid_size: int, batch_size: int, augment: bool, shuffle: bool, augmentation_seed: int | None = None ):
 	'''
 	Generator yielding (image_batch, label_batch) per batch, where image_batch has shape
-	(batch_size, patch_grid_size ** 2, img_size, img_size, 3) and label_batch holds the
-	raw string labels ('REAL' / 'FAKE') for that batch, in matching row order. The final
-	batch of a split may be smaller than batch_size if the split size isn't a multiple of it.
+	(batch_size, patch_grid_size ** 2, img_size, img_size, 3) and label_batch holds numeric
+	targets (LABEL_TO_TARGET) in matching row order. The final batch of a split may be
+	smaller than batch_size if the split size isn't a multiple of it.
 
-	Batching is plain Python-generator batching, not tf.data.Dataset — sufficient for this
-	plumbing sub-step (Phase 3.9). The per-image FFT + 81-patch resize cost flagged in 3.6
-	(~85ms/image) means this generator is the natural seam for Phase 5 to wrap in
-	tf.data.Dataset.from_generator with a parallel .map() if real training throughput
-	demands it — not done here since there's no model yet to feed.
+	Batching is plain Python-generator batching, not tf.data.Dataset — wrapped in
+	tf.data.Dataset.from_generator() by main() below (the seam 3.9's docstring already
+	flagged for "once there's a model to feed"), not rebuilt as one internally, so this
+	generator itself stays simple and independently testable.
 
 	Shuffling (row order only) happens here, not in splitter.py (which deliberately leaves
 	row order untouched). Draws from whatever global seed is currently active via seed.py —
-	no local RNG instantiated in this function.
+	no local RNG instantiated for shuffling.
+
+	augmentation_seed seeds a local, this-call-only np.random.Generator that hands each
+	image its own sub-seed for augment_image() — deterministic given the same
+	augmentation_seed (needed for job reruns to reproduce identical loss curves), but
+	varying image-to-image within the call (not one repeated transform for the whole
+	batch). None (default, and always used for augment=False callers) leaves augmentation
+	off entirely — irrelevant/unused in that case.
 	'''
 
 	indices = np.arange( len( split_df ) )
 
 	if shuffle:
 		np.random.shuffle( indices )
+
+	augmentation_rng = np.random.default_rng( augmentation_seed )
 
 	for start in range( 0, len( indices ), batch_size ):
 		batch_rows = split_df.iloc[ indices[ start : start + batch_size ] ]
@@ -61,11 +84,37 @@ def build_batches( split_df, img_size: int, patch_grid_size: int, batch_size: in
 			image = load_image( row[ 'image_path' ], img_size )
 
 			if augment:
-				image = augment_image( image )
+				image_seed = int( augmentation_rng.integers( 0, 2 ** 31 - 1 ) )
+				image = augment_image( image, seed=image_seed )
 
 			patches.append( preprocess_image( image, patch_grid_size, img_size ) )
 
-		yield np.stack( patches, axis=0 ), batch_rows[ 'label' ].to_numpy()
+		labels = np.array( [ LABEL_TO_TARGET[ label ] for label in batch_rows[ 'label' ] ], dtype=np.float32 )
+
+		yield np.stack( patches, axis=0 ), labels
+
+
+def build_patch_averaged_model( member_model: tf.keras.Model, patch_grid_size: int, img_size: int ) -> tf.keras.Model:
+	'''
+	Wrap a single-image backbone+head model (5.1/5.2: input (img_size, img_size, 3) ->
+	scalar sigmoid) so it accepts a full patch grid per training example and averages the
+	per-patch scores into one image-level prediction — steps 5-6 of the DFT patch pipeline
+	(CLAUDE.md): "XCeption processes each patch independently -> scalar score. Average pool
+	across all patch_grid_size**2 scores -> image-level prediction."
+
+	TimeDistributed applies member_model to all patch_grid_size**2 patches via one batched
+	call (Keras reshapes (batch, patches, H, W, 3) -> (batch*patches, H, W, 3) internally,
+	not a Python loop over patches), and preserves member_model's own frozen/trainable
+	layer split — freezing is a property of member_model's layers, unaffected by this
+	wrapping.
+	'''
+
+	patch_count = patch_grid_size ** 2
+	patch_input = tf.keras.layers.Input( shape=( patch_count, img_size, img_size, 3 ) )
+	patch_scores = tf.keras.layers.TimeDistributed( member_model )( patch_input )
+	image_score = tf.keras.layers.Lambda( lambda scores: tf.reduce_mean( scores, axis=1 ) )( patch_scores )
+
+	return tf.keras.Model( inputs=patch_input, outputs=image_score )
 
 
 def main() -> None:
@@ -104,48 +153,132 @@ def main() -> None:
 			'test_rows': len( splits[ 'test' ] ),
 		} )
 
-		# Ensemble loop — members differentiated by seed, per Section 9.3 of the
-		# architecture doc. Re-seeded once per member, not once for the whole run.
-		for member_index in range( experiment.ensemble_size ):
-			member_seed = set_global_seed( experiment.random_seed + member_index )
-			log.info( 'Ensemble member seeded', extra={
-				'job_id': job_id, 'ensemble_member': member_index, 'seed': member_seed,
-			} )
+		# Single ensemble member — Task 5.4 scope is the training loop itself, isolated
+		# from the ensemble wrapper (already validated in 5.3) so a training-loop bug
+		# surfaces here, not after burning 3x the compute. ensemble_size is intentionally
+		# ignored; 5.5 loops over all members using this same per-member construction.
+		member_index = 0
+		member_seed = set_global_seed( experiment.random_seed + member_index )
+		log.info( 'Ensemble member seeded', extra={
+			'job_id': job_id, 'ensemble_member': member_index, 'seed': member_seed,
+		} )
 
-			train_batches = build_batches(
+		# Model — backbone + head (5.1/5.2), wrapped for the patch grid (see
+		# build_patch_averaged_model docstring)
+		backbone = build_backbone( experiment )
+		head_output = build_head( backbone.output, experiment )
+		member_model = tf.keras.Model( inputs=backbone.input, outputs=head_output )
+		model = build_patch_averaged_model( member_model, experiment.patch_grid_size, experiment.img_size )
+
+		model.compile(
+			optimizer = tf.keras.optimizers.Adam( learning_rate=experiment.learning_rate ),
+			loss = 'binary_crossentropy',
+			metrics = [ 'accuracy' ],
+		)
+
+		# class_weight, keyed by the model's own {0.0, 1.0} target encoding rather than the
+		# raw label strings splitter.py computed it from
+		numeric_class_weights = { LABEL_TO_TARGET[ label ]: weight for label, weight in class_weights.items() }
+
+		# tf.data wrapping — the seam 3.9's build_batches docstring already flagged for
+		# "once there's a model to feed" (there is, now). A plain Python generator is
+		# exhausted after one pass; .repeat() re-invokes the factory functions below each
+		# epoch to get a fresh pass. train's factory closes over a mutable counter so
+		# successive epochs get a distinct-but-deterministic augmentation_seed
+		# (member_seed + epoch index) — reruns of the whole job are reproducible (same
+		# member_seed -> same per-epoch seed sequence), while different epochs within one
+		# run still see different augmentations, not the same one repeated every epoch.
+		#
+		# sample_weight (not model.fit's class_weight= kwarg) carries the class balancing —
+		# class_weight's support alongside a tf.data.Dataset input varies across Keras
+		# versions, while sample_weight as a third yielded array is universally supported
+		# for any input type. Only the training stream is weighted; validation intentionally
+		# is not, so val_loss reflects the real, unweighted loss.
+		train_epoch_counter = { 'value': 0 }
+
+		def train_generator():
+			seed_for_epoch = member_seed + train_epoch_counter[ 'value' ]
+			train_epoch_counter[ 'value' ] += 1
+
+			for images, labels in build_batches(
 				splits[ 'train' ], experiment.img_size, experiment.patch_grid_size,
-				experiment.batch_size, augment=True, shuffle=True,
-			)
-			val_batches = build_batches(
+				experiment.batch_size, augment=True, shuffle=True, augmentation_seed=seed_for_epoch,
+			):
+				sample_weight = np.array( [ numeric_class_weights[ label ] for label in labels ], dtype=np.float32 )
+
+				yield images, labels, sample_weight
+
+		def val_generator():
+			yield from build_batches(
 				splits[ 'val' ], experiment.img_size, experiment.patch_grid_size,
 				experiment.batch_size, augment=False, shuffle=False,
 			)
 
-			# One batch pulled from each here to prove the pipeline shape end to end.
-			# Phase 5's real model.fit call consumes the full generators for
-			# experiment.epochs epochs — that loop lives inside the model call, not here.
-			train_images, train_labels = next( train_batches )
-			val_images, val_labels = next( val_batches )
+		patch_count = experiment.patch_grid_size ** 2
+		image_spec = tf.TensorSpec( shape=( None, patch_count, experiment.img_size, experiment.img_size, 3 ), dtype=tf.float32 )
+		label_spec = tf.TensorSpec( shape=( None, ), dtype=tf.float32 )
 
-			log.info( 'Batch produced', extra={
-				'job_id': job_id, 'ensemble_member': member_index,
-				'split': 'train', 'batch_shape': list( train_images.shape ),
-			} )
-			log.info( 'Batch produced', extra={
-				'job_id': job_id, 'ensemble_member': member_index,
-				'split': 'val', 'batch_shape': list( val_images.shape ),
-			} )
+		train_dataset = tf.data.Dataset.from_generator(
+			train_generator, output_signature=( image_spec, label_spec, label_spec ),
+		).repeat()
+		val_dataset = tf.data.Dataset.from_generator(
+			val_generator, output_signature=( image_spec, label_spec ),
+		).repeat()
 
-			# --- Phase 5 placeholder — model construction and training not yet built ---
-			# model = build_ensemble_member( experiment, member_index )
-			# model.fit(
-			#     train_dataset, validation_data = val_dataset,
-			#     epochs = experiment.epochs, class_weight = class_weights,
-			#     callbacks = build_callbacks( job_id, member_index ),
-			# )
-			log.info( 'Phase 5 placeholder reached — model training not yet implemented', extra={
-				'job_id': job_id, 'ensemble_member': member_index, 'class_weights': class_weights,
-			} )
+		# Ceiling division — the final, possibly-smaller batch each pass through a split
+		# still counts as one step, matching build_batches' own range(0, len, batch_size)
+		steps_per_epoch = -( -len( splits[ 'train' ] ) // experiment.batch_size )
+		validation_steps = -( -len( splits[ 'val' ] ) // experiment.batch_size )
+
+		log.info( 'Model built, starting fit', extra={
+			'job_id': job_id, 'ensemble_member': member_index,
+			'steps_per_epoch': steps_per_epoch, 'validation_steps': validation_steps,
+			'epochs': experiment.epochs, 'batch_size': experiment.batch_size,
+		} )
+
+		# Checkpoint + training log both need a real local file path (Keras' save/CSVLogger
+		# APIs are file-path-based, not in-memory) — this tempdir is transient scratch, not
+		# durable state. GCS (below, after the block) is the durable resting place, so the
+		# ephemeral container filesystem never holds the only copy.
+		with tempfile.TemporaryDirectory() as tmp_dir:
+			log_csv_path = f'{ tmp_dir }/member_{ member_index }.csv'
+			checkpoint_path = f'{ tmp_dir }/member_{ member_index }.keras'
+
+			callbacks = [
+				tf.keras.callbacks.EarlyStopping(
+					monitor = 'val_loss', patience = experiment.early_stopping_patience, restore_best_weights = True,
+				),
+				tf.keras.callbacks.CSVLogger( log_csv_path ),
+				FirestoreEpochCallback( job_id, member_index ),
+			]
+
+			model.fit(
+				train_dataset,
+				validation_data = val_dataset,
+				epochs = experiment.epochs,
+				steps_per_epoch = steps_per_epoch,
+				validation_steps = validation_steps,
+				callbacks = callbacks,
+				verbose = 2,
+			)
+
+			model.save( checkpoint_path )
+
+			with open( checkpoint_path, 'rb' ) as f:
+				checkpoint_bytes = f.read()
+
+			with open( log_csv_path, 'rb' ) as f:
+				log_csv_bytes = f.read()
+
+		checkpoint_uri = f'gs://{ config.GCS_BUCKET }/checkpoints/{ job_id }/member_{ member_index }.keras'
+		upload_bytes_to_blob( checkpoint_uri, checkpoint_bytes )
+		log.info( 'Checkpoint uploaded', extra={ 'job_id': job_id, 'checkpoint_uri': checkpoint_uri } )
+
+		log_csv_uri = f'gs://{ config.GCS_BUCKET }/logs/{ job_id }/member_{ member_index }.csv'
+		upload_bytes_to_blob( log_csv_uri, log_csv_bytes )
+		log.info( 'Training log uploaded', extra={ 'job_id': job_id, 'log_csv_uri': log_csv_uri } )
+
+		jobs.update_job_status( job_id, 'COMPLETED' )
 
 	except Exception as exc:
 		jobs.update_job_error( job_id, str( exc ) )
@@ -153,8 +286,7 @@ def main() -> None:
 		log.exception( 'Training pipeline failed', extra={ 'job_id': job_id } )
 		sys.exit( 1 )
 
-	# Status is deliberately left at RUNNING, not COMPLETED — see handoff notes.
-	log.info( 'Data pipeline plumbing check complete — model training is Phase 5', extra={ 'job_id': job_id } )
+	log.info( 'Training job complete', extra={ 'job_id': job_id } )
 
 
 if __name__ == '__main__':

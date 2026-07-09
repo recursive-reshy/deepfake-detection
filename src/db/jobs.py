@@ -41,3 +41,12 @@ def update_job_error( job_id: str, error: str ) -> None:
 		'error': error,
 		'updated_at': datetime.now( timezone.utc ),
 	} )
+
+def update_job_progress( job_id: str, current_epoch: int ) -> None:
+	client = get_client()
+	job_ref = client.collection( JOBS_COLLECTION ).document( job_id )
+
+	job_ref.update( {
+		'current_epoch': current_epoch,
+		'updated_at': datetime.now( timezone.utc ),
+	} )

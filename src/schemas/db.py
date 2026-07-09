@@ -17,6 +17,11 @@ class JobDocument( BaseModel ):
 	updated_at: datetime
 	error: str | None = None
 
+	# Bumped once per completed epoch by training/callbacks.py's FirestoreEpochCallback —
+	# lets a client poll job state for live progress instead of only the epochs
+	# subcollection, without waiting for the job to reach a terminal status.
+	current_epoch: int | None = None
+
 class EpochRecord( BaseModel ):
 	ensemble_member: int
 	epoch: int
