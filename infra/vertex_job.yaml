@@ -3,10 +3,9 @@ displayName: deepfake-detection-{job_id}
 jobSpec:
   workerPoolSpecs:
     - machineSpec:
-        machineType: n1-standard-4
-        # Pending approval for GPU usage on Vertex AI. Uncomment the following lines to enable GPU usage.
-        # acceleratorType: NVIDIA_TESLA_T4
-        # acceleratorCount: 1
+        machineType: g2-standard-4
+        acceleratorType: NVIDIA_L4
+        acceleratorCount: 1
       replicaCount: 1
       containerSpec:
         imageUri: {image_uri}
