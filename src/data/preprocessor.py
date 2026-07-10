@@ -46,4 +46,14 @@ def preprocess_image( image: np.ndarray, patch_grid_size: int, img_size: int ) -
 			patch = cv2.resize( patch, ( img_size, img_size ), interpolation=cv2.INTER_LINEAR )
 			patches.append( patch )
 
-	return np.stack( patches, axis=0 ).astype( np.float32 )
+	stacked_patches = np.stack( patches, axis=0 ).astype( np.float32 )
+
+	# Explicit cleanup (Task 5.5 memory-mitigation amendment) — this function runs once per
+	# image, patch_grid_size**2 times per call, many calls per batch/epoch, so the pre-stack
+	# per-patch list and the full-image spectrum array are dereferenced immediately once
+	# stacked_patches (the actual return value) is produced, rather than relying on
+	# function-return scope to eventually free them.
+	del patches
+	del spectrum
+
+	return stacked_patches

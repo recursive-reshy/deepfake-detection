@@ -3,7 +3,7 @@ displayName: deepfake-detection-{job_id}
 jobSpec:
   workerPoolSpecs:
     - machineSpec:
-        machineType: g2-standard-4
+        machineType: g2-standard-16
         acceleratorType: NVIDIA_L4
         acceleratorCount: 1
       replicaCount: 1
@@ -20,3 +20,23 @@ jobSpec:
         env:
           - name: GCP_PROJECT_ID
             value: deepfake-detection-ct0391
+          - name: GCS_BUCKET
+            value: uneeb-zulfiqar-deepfake-detection
+          - name: NOTIFY_EMAIL
+            value: reshs92.09@gmail.com # TODO: set before submitting a real job — SendGrid completion email is skipped (logged, not fatal) while this is a placeholder
+          # glibc allocator tuning (Task 5.5 memory-mitigation amendment) — mitigates the
+          # host-RAM OOM diagnosed on job 775354434308800512 (eager, fully-materialized
+          # 81-patch batch construction fragmenting glibc's allocator over sustained
+          # training steps; see src/training/train.py's build_batches() and
+          # src/data/preprocessor.py's preprocess_image() for the paired explicit-cleanup
+          # side of this mitigation).
+          - name: MALLOC_ARENA_MAX
+            value: "1" # single-process training loop — no benefit from multiple malloc arenas, only fragmentation risk
+          - name: MALLOC_TRIM_THRESHOLD_
+            value: "131072" # 128KB — proactively return freed memory to the OS at this threshold, matching the value glibc was already auto-applying reactively in the failed job's logs
+          # SENDGRID_API_KEY deliberately not listed here — never committed to this
+          # git-tracked file, per CLAUDE.md's Secrets section (same rule as Cloud Run's
+          # --set-secrets, applied to Vertex AI's env mechanism). The training container
+          # needs it delivered via Secret Manager + this job's service account at the
+          # infra layer — outside this file's scope; callbacks.py reads it with a plain
+          # os.getenv('SENDGRID_API_KEY') either way.

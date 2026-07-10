@@ -1,5 +1,6 @@
 # Standard library
 import argparse
+import gc
 import logging
 import sys
 import tempfile
@@ -24,6 +25,10 @@ from src.models.backbone import build_backbone
 from src.models.head import build_head
 # Training
 from src.training.callbacks import FirestoreEpochCallback
+from src.training.callbacks import send_job_completion_email
+from src.training.adversarial import fine_tune_with_fgsm
+# Schemas
+from src.schemas.experiment import ExperimentConfig
 # Utils
 from src.utils.seed import set_global_seed
 from src.utils.gcs import upload_bytes_to_blob
@@ -53,9 +58,9 @@ def build_batches( split_df, img_size: int, patch_grid_size: int, batch_size: in
 	smaller than batch_size if the split size isn't a multiple of it.
 
 	Batching is plain Python-generator batching, not tf.data.Dataset — wrapped in
-	tf.data.Dataset.from_generator() by main() below (the seam 3.9's docstring already
-	flagged for "once there's a model to feed"), not rebuilt as one internally, so this
-	generator itself stays simple and independently testable.
+	tf.data.Dataset.from_generator() by train_member() below (the seam 3.9's docstring
+	already flagged for "once there's a model to feed"), not rebuilt as one internally, so
+	this generator itself stays simple and independently testable.
 
 	Shuffling (row order only) happens here, not in splitter.py (which deliberately leaves
 	row order untouched). Draws from whatever global seed is currently active via seed.py —
@@ -90,8 +95,20 @@ def build_batches( split_df, img_size: int, patch_grid_size: int, batch_size: in
 			patches.append( preprocess_image( image, patch_grid_size, img_size ) )
 
 		labels = np.array( [ LABEL_TO_TARGET[ label ] for label in batch_rows[ 'label' ] ], dtype=np.float32 )
+		batch_images = np.stack( patches, axis=0 )
 
-		yield np.stack( patches, axis=0 ), labels
+		yield batch_images, labels
+
+		# Explicit cleanup (Task 5.5 memory-mitigation amendment) — drop the intermediate
+		# per-image patches list (not batch_images/labels, already handed to the consumer
+		# above) and the last loop's image buffer immediately once the consumer has this
+		# batch, then force a collection, rather than waiting on this generator's own
+		# scope/next-iteration reassignment to eventually free them. Every batch here is
+		# ~1,300 patches' worth of same-sized float32 arrays cycling through — exactly the
+		# allocation pattern that fragments glibc's allocator over many sustained steps.
+		del patches
+		del image
+		gc.collect()
 
 
 def build_patch_averaged_model( member_model: tf.keras.Model, patch_grid_size: int, img_size: int ) -> tf.keras.Model:
@@ -115,6 +132,171 @@ def build_patch_averaged_model( member_model: tf.keras.Model, patch_grid_size: i
 	image_score = tf.keras.layers.Lambda( lambda scores: tf.reduce_mean( scores, axis=1 ) )( patch_scores )
 
 	return tf.keras.Model( inputs=patch_input, outputs=image_score )
+
+
+def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, splits: dict, class_weights: dict ) -> None:
+	'''
+	Build, train, optionally adversarially fine-tune, and persist one ensemble member —
+	extracted out of main()'s per-member loop (5.5) rather than kept inline, since it's now
+	called config.ensemble_size times instead of once (5.4's single-member scope). Every
+	side effect (Firestore epoch writes, GCS checkpoint/log upload) is tagged with
+	member_index, so members never overwrite each other's records or artefacts.
+
+	Raises straight through on any failure — main()'s outer try/except is what turns one
+	member's exception into the whole job's FAILED status; this function doesn't swallow
+	errors to let sibling members continue, per 5.5's requirement that one member failing
+	fails the whole job rather than silently completing with fewer members than requested.
+	'''
+
+	member_seed = set_global_seed( experiment.random_seed + member_index )
+	log.info( 'Ensemble member seeded', extra={
+		'job_id': job_id, 'ensemble_member': member_index, 'seed': member_seed,
+	} )
+
+	# Model — backbone + head (5.1/5.2), wrapped for the patch grid (see
+	# build_patch_averaged_model docstring)
+	backbone = build_backbone( experiment )
+	head_output = build_head( backbone.output, experiment )
+	member_model = tf.keras.Model( inputs=backbone.input, outputs=head_output )
+	model = build_patch_averaged_model( member_model, experiment.patch_grid_size, experiment.img_size )
+
+	model.compile(
+		optimizer = tf.keras.optimizers.Adam( learning_rate=experiment.learning_rate ),
+		loss = 'binary_crossentropy',
+		metrics = [ 'accuracy' ],
+	)
+
+	# class_weight, keyed by the model's own {0.0, 1.0} target encoding rather than the
+	# raw label strings splitter.py computed it from
+	numeric_class_weights = { LABEL_TO_TARGET[ label ]: weight for label, weight in class_weights.items() }
+
+	# tf.data wrapping — the seam 3.9's build_batches docstring already flagged for
+	# "once there's a model to feed" (there is, now). A plain Python generator is
+	# exhausted after one pass; .repeat() re-invokes the factory functions below each
+	# epoch to get a fresh pass. train's factory closes over a mutable counter so
+	# successive epochs get a distinct-but-deterministic augmentation_seed
+	# (member_seed + epoch index) — reruns of the whole job are reproducible (same
+	# member_seed -> same per-epoch seed sequence), while different epochs within one
+	# run still see different augmentations, not the same one repeated every epoch.
+	#
+	# sample_weight (not model.fit's class_weight= kwarg) carries the class balancing —
+	# class_weight's support alongside a tf.data.Dataset input varies across Keras
+	# versions, while sample_weight as a third yielded array is universally supported
+	# for any input type. Only the training stream is weighted; validation intentionally
+	# is not, so val_loss reflects the real, unweighted loss.
+	train_epoch_counter = { 'value': 0 }
+
+	def train_generator():
+		seed_for_epoch = member_seed + train_epoch_counter[ 'value' ]
+		train_epoch_counter[ 'value' ] += 1
+
+		for images, labels in build_batches(
+			splits[ 'train' ], experiment.img_size, experiment.patch_grid_size,
+			experiment.batch_size, augment=True, shuffle=True, augmentation_seed=seed_for_epoch,
+		):
+			sample_weight = np.array( [ numeric_class_weights[ label ] for label in labels ], dtype=np.float32 )
+
+			yield images, labels, sample_weight
+
+	def val_generator():
+		yield from build_batches(
+			splits[ 'val' ], experiment.img_size, experiment.patch_grid_size,
+			experiment.batch_size, augment=False, shuffle=False,
+		)
+
+	patch_count = experiment.patch_grid_size ** 2
+	image_spec = tf.TensorSpec( shape=( None, patch_count, experiment.img_size, experiment.img_size, 3 ), dtype=tf.float32 )
+	label_spec = tf.TensorSpec( shape=( None, ), dtype=tf.float32 )
+
+	train_dataset = tf.data.Dataset.from_generator(
+		train_generator, output_signature=( image_spec, label_spec, label_spec ),
+	).repeat()
+	val_dataset = tf.data.Dataset.from_generator(
+		val_generator, output_signature=( image_spec, label_spec ),
+	).repeat()
+
+	# Ceiling division — the final, possibly-smaller batch each pass through a split
+	# still counts as one step, matching build_batches' own range(0, len, batch_size)
+	steps_per_epoch = -( -len( splits[ 'train' ] ) // experiment.batch_size )
+	validation_steps = -( -len( splits[ 'val' ] ) // experiment.batch_size )
+
+	log.info( 'Model built, starting fit', extra={
+		'job_id': job_id, 'ensemble_member': member_index,
+		'steps_per_epoch': steps_per_epoch, 'validation_steps': validation_steps,
+		'epochs': experiment.epochs, 'batch_size': experiment.batch_size,
+	} )
+
+	# Checkpoint + training log both need a real local file path (Keras' save/CSVLogger
+	# APIs are file-path-based, not in-memory) — this tempdir is transient scratch, not
+	# durable state. GCS (below, after the block) is the durable resting place, so the
+	# ephemeral container filesystem never holds the only copy.
+	with tempfile.TemporaryDirectory() as tmp_dir:
+		log_csv_path = f'{ tmp_dir }/member_{ member_index }.csv'
+		checkpoint_path = f'{ tmp_dir }/member_{ member_index }.keras'
+		adversarial_checkpoint_path = f'{ tmp_dir }/member_{ member_index }_adversarial.keras'
+
+		callbacks = [
+			tf.keras.callbacks.EarlyStopping(
+				monitor = 'val_loss', patience = experiment.early_stopping_patience, restore_best_weights = True,
+			),
+			tf.keras.callbacks.CSVLogger( log_csv_path ),
+			FirestoreEpochCallback( job_id, member_index ),
+		]
+
+		model.fit(
+			train_dataset,
+			validation_data = val_dataset,
+			epochs = experiment.epochs,
+			steps_per_epoch = steps_per_epoch,
+			validation_steps = validation_steps,
+			callbacks = callbacks,
+			verbose = 2,
+		)
+
+		model.save( checkpoint_path )
+
+		with open( checkpoint_path, 'rb' ) as f:
+			checkpoint_bytes = f.read()
+
+		with open( log_csv_path, 'rb' ) as f:
+			log_csv_bytes = f.read()
+
+		adversarial_checkpoint_bytes = None
+
+		# FGSM fine-tuning (5.6) — per member, after that member's own initial training
+		# converges, never on the fused ensemble output (System Architecture Doc 9.5).
+		# Saved as a *separate* checkpoint (not an overwrite of checkpoint_path above) —
+		# Phase 6 Stage 1 evaluation needs the pre-adversarial model's clean accuracy,
+		# Stage 2 needs this adversarially-fine-tuned one; overwriting would destroy the
+		# one Stage 1 needs.
+		if experiment.adversarial_training:
+			log.info( 'Starting adversarial fine-tuning', extra={
+				'job_id': job_id, 'ensemble_member': member_index, 'epsilon': experiment.adversarial_epsilon,
+			} )
+
+			fine_tune_with_fgsm( model, train_generator(), experiment.learning_rate, experiment.adversarial_epsilon )
+
+			model.save( adversarial_checkpoint_path )
+
+			with open( adversarial_checkpoint_path, 'rb' ) as f:
+				adversarial_checkpoint_bytes = f.read()
+
+			log.info( 'Adversarial fine-tuning complete', extra={ 'job_id': job_id, 'ensemble_member': member_index } )
+
+	checkpoint_uri = f'gs://{ config.GCS_BUCKET }/checkpoints/{ job_id }/member_{ member_index }.keras'
+	upload_bytes_to_blob( checkpoint_uri, checkpoint_bytes )
+	log.info( 'Checkpoint uploaded', extra={ 'job_id': job_id, 'ensemble_member': member_index, 'checkpoint_uri': checkpoint_uri } )
+
+	log_csv_uri = f'gs://{ config.GCS_BUCKET }/logs/{ job_id }/member_{ member_index }.csv'
+	upload_bytes_to_blob( log_csv_uri, log_csv_bytes )
+	log.info( 'Training log uploaded', extra={ 'job_id': job_id, 'ensemble_member': member_index, 'log_csv_uri': log_csv_uri } )
+
+	if adversarial_checkpoint_bytes is not None:
+		adversarial_checkpoint_uri = f'gs://{ config.GCS_BUCKET }/checkpoints/{ job_id }/member_{ member_index }_adversarial.keras'
+		upload_bytes_to_blob( adversarial_checkpoint_uri, adversarial_checkpoint_bytes )
+		log.info( 'Adversarial checkpoint uploaded', extra={
+			'job_id': job_id, 'ensemble_member': member_index, 'checkpoint_uri': adversarial_checkpoint_uri,
+		} )
 
 
 def main() -> None:
@@ -153,136 +335,22 @@ def main() -> None:
 			'test_rows': len( splits[ 'test' ] ),
 		} )
 
-		# Single ensemble member — Task 5.4 scope is the training loop itself, isolated
-		# from the ensemble wrapper (already validated in 5.3) so a training-loop bug
-		# surfaces here, not after burning 3x the compute. ensemble_size is intentionally
-		# ignored; 5.5 loops over all members using this same per-member construction.
-		member_index = 0
-		member_seed = set_global_seed( experiment.random_seed + member_index )
-		log.info( 'Ensemble member seeded', extra={
-			'job_id': job_id, 'ensemble_member': member_index, 'seed': member_seed,
-		} )
-
-		# Model — backbone + head (5.1/5.2), wrapped for the patch grid (see
-		# build_patch_averaged_model docstring)
-		backbone = build_backbone( experiment )
-		head_output = build_head( backbone.output, experiment )
-		member_model = tf.keras.Model( inputs=backbone.input, outputs=head_output )
-		model = build_patch_averaged_model( member_model, experiment.patch_grid_size, experiment.img_size )
-
-		model.compile(
-			optimizer = tf.keras.optimizers.Adam( learning_rate=experiment.learning_rate ),
-			loss = 'binary_crossentropy',
-			metrics = [ 'accuracy' ],
-		)
-
-		# class_weight, keyed by the model's own {0.0, 1.0} target encoding rather than the
-		# raw label strings splitter.py computed it from
-		numeric_class_weights = { LABEL_TO_TARGET[ label ]: weight for label, weight in class_weights.items() }
-
-		# tf.data wrapping — the seam 3.9's build_batches docstring already flagged for
-		# "once there's a model to feed" (there is, now). A plain Python generator is
-		# exhausted after one pass; .repeat() re-invokes the factory functions below each
-		# epoch to get a fresh pass. train's factory closes over a mutable counter so
-		# successive epochs get a distinct-but-deterministic augmentation_seed
-		# (member_seed + epoch index) — reruns of the whole job are reproducible (same
-		# member_seed -> same per-epoch seed sequence), while different epochs within one
-		# run still see different augmentations, not the same one repeated every epoch.
-		#
-		# sample_weight (not model.fit's class_weight= kwarg) carries the class balancing —
-		# class_weight's support alongside a tf.data.Dataset input varies across Keras
-		# versions, while sample_weight as a third yielded array is universally supported
-		# for any input type. Only the training stream is weighted; validation intentionally
-		# is not, so val_loss reflects the real, unweighted loss.
-		train_epoch_counter = { 'value': 0 }
-
-		def train_generator():
-			seed_for_epoch = member_seed + train_epoch_counter[ 'value' ]
-			train_epoch_counter[ 'value' ] += 1
-
-			for images, labels in build_batches(
-				splits[ 'train' ], experiment.img_size, experiment.patch_grid_size,
-				experiment.batch_size, augment=True, shuffle=True, augmentation_seed=seed_for_epoch,
-			):
-				sample_weight = np.array( [ numeric_class_weights[ label ] for label in labels ], dtype=np.float32 )
-
-				yield images, labels, sample_weight
-
-		def val_generator():
-			yield from build_batches(
-				splits[ 'val' ], experiment.img_size, experiment.patch_grid_size,
-				experiment.batch_size, augment=False, shuffle=False,
-			)
-
-		patch_count = experiment.patch_grid_size ** 2
-		image_spec = tf.TensorSpec( shape=( None, patch_count, experiment.img_size, experiment.img_size, 3 ), dtype=tf.float32 )
-		label_spec = tf.TensorSpec( shape=( None, ), dtype=tf.float32 )
-
-		train_dataset = tf.data.Dataset.from_generator(
-			train_generator, output_signature=( image_spec, label_spec, label_spec ),
-		).repeat()
-		val_dataset = tf.data.Dataset.from_generator(
-			val_generator, output_signature=( image_spec, label_spec ),
-		).repeat()
-
-		# Ceiling division — the final, possibly-smaller batch each pass through a split
-		# still counts as one step, matching build_batches' own range(0, len, batch_size)
-		steps_per_epoch = -( -len( splits[ 'train' ] ) // experiment.batch_size )
-		validation_steps = -( -len( splits[ 'val' ] ) // experiment.batch_size )
-
-		log.info( 'Model built, starting fit', extra={
-			'job_id': job_id, 'ensemble_member': member_index,
-			'steps_per_epoch': steps_per_epoch, 'validation_steps': validation_steps,
-			'epochs': experiment.epochs, 'batch_size': experiment.batch_size,
-		} )
-
-		# Checkpoint + training log both need a real local file path (Keras' save/CSVLogger
-		# APIs are file-path-based, not in-memory) — this tempdir is transient scratch, not
-		# durable state. GCS (below, after the block) is the durable resting place, so the
-		# ephemeral container filesystem never holds the only copy.
-		with tempfile.TemporaryDirectory() as tmp_dir:
-			log_csv_path = f'{ tmp_dir }/member_{ member_index }.csv'
-			checkpoint_path = f'{ tmp_dir }/member_{ member_index }.keras'
-
-			callbacks = [
-				tf.keras.callbacks.EarlyStopping(
-					monitor = 'val_loss', patience = experiment.early_stopping_patience, restore_best_weights = True,
-				),
-				tf.keras.callbacks.CSVLogger( log_csv_path ),
-				FirestoreEpochCallback( job_id, member_index ),
-			]
-
-			model.fit(
-				train_dataset,
-				validation_data = val_dataset,
-				epochs = experiment.epochs,
-				steps_per_epoch = steps_per_epoch,
-				validation_steps = validation_steps,
-				callbacks = callbacks,
-				verbose = 2,
-			)
-
-			model.save( checkpoint_path )
-
-			with open( checkpoint_path, 'rb' ) as f:
-				checkpoint_bytes = f.read()
-
-			with open( log_csv_path, 'rb' ) as f:
-				log_csv_bytes = f.read()
-
-		checkpoint_uri = f'gs://{ config.GCS_BUCKET }/checkpoints/{ job_id }/member_{ member_index }.keras'
-		upload_bytes_to_blob( checkpoint_uri, checkpoint_bytes )
-		log.info( 'Checkpoint uploaded', extra={ 'job_id': job_id, 'checkpoint_uri': checkpoint_uri } )
-
-		log_csv_uri = f'gs://{ config.GCS_BUCKET }/logs/{ job_id }/member_{ member_index }.csv'
-		upload_bytes_to_blob( log_csv_uri, log_csv_bytes )
-		log.info( 'Training log uploaded', extra={ 'job_id': job_id, 'log_csv_uri': log_csv_uri } )
+		# Ensemble loop (5.5) — sequential, not parallel (single GPU, no need to complicate
+		# this). Each member is fully independent (own seed, own augmentation stream, own
+		# checkpoint/log path — see train_member()'s docstring); an exception from any
+		# member propagates straight to the except block below rather than being caught
+		# per-member, so one failure fails the whole job instead of silently completing
+		# with fewer members than config.ensemble_size requested.
+		for member_index in range( experiment.ensemble_size ):
+			train_member( experiment, job_id, member_index, splits, class_weights )
 
 		jobs.update_job_status( job_id, 'COMPLETED' )
+		send_job_completion_email( job_id, 'COMPLETED' )
 
 	except Exception as exc:
 		jobs.update_job_error( job_id, str( exc ) )
 		jobs.update_job_status( job_id, 'FAILED' )
+		send_job_completion_email( job_id, 'FAILED' )
 		log.exception( 'Training pipeline failed', extra={ 'job_id': job_id } )
 		sys.exit( 1 )
 

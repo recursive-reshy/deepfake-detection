@@ -1,9 +1,15 @@
 # Standard library
 import logging
+import os
 from datetime import datetime
 from datetime import timezone
 # TensorFlow
 import tensorflow as tf
+# SendGrid
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+# Config
+import config
 # Schemas
 from src.schemas.db import EpochRecord
 # DB
@@ -11,6 +17,11 @@ from src.db import epochs
 from src.db import jobs
 
 log = logging.getLogger( __name__ )
+
+# Must be a SendGrid-verified sender — no dedicated config var for this exists (CLAUDE.md's
+# env var table only documents NOTIFY_EMAIL, the recipient), so it's a fixed constant here
+# rather than invented config surface nothing else reads.
+NOTIFICATION_FROM_EMAIL = 'noreply@deepfake-detection.dev'
 
 
 class FirestoreEpochCallback( tf.keras.callbacks.Callback ):
@@ -21,10 +32,6 @@ class FirestoreEpochCallback( tf.keras.callbacks.Callback ):
 	reconstructed only at the end of training) is the live source of per-epoch progress —
 	a container restart mid-training loses nothing already past this callback, consistent
 	with the "Firestore as sole state source" principle already locked from Phase 3/4.
-
-	SendGrid notification is deliberately not wired here — this callback's job for Task 5.4
-	is scoped to the epoch -> Firestore bridge only. Job-completion email is out of scope
-	for a single-member smoke-test training run (see the 5.4 handoff brief).
 	'''
 
 	def __init__( self, job_id: str, ensemble_member: int ):
@@ -54,3 +61,43 @@ class FirestoreEpochCallback( tf.keras.callbacks.Callback ):
 			'loss': record.loss, 'val_loss': record.val_loss,
 			'accuracy': record.accuracy, 'val_accuracy': record.val_accuracy,
 		} )
+
+
+def send_job_completion_email( job_id: str, status: str ) -> None:
+	'''
+	Fires once, after every ensemble member finishes (or the job fails) — not a per-epoch
+	Keras callback, called directly from train.py's main() alongside the terminal status
+	transition. Lives in this module rather than train.py because callbacks.py's job, per
+	the System Architecture Doc's folder structure, is "Keras callbacks + Firestore job
+	state writes + SendGrid".
+
+	SENDGRID_API_KEY is read from the environment only (os.getenv), never from .env, never
+	hardcoded, per CLAUDE.md's Secrets section. Cloud Run gets it via --set-secrets; the
+	Vertex AI training container needs the equivalent secure delivery wired at the infra
+	layer (Secret Manager + the job's service account) — outside this module's scope, and
+	no application code change is needed either way, since both paths land the value in
+	the same environment variable this function reads.
+
+	A missing key/recipient or a SendGrid API failure is logged and swallowed, not raised —
+	email is a notification, not a step whose failure should flip an otherwise-successful
+	training job to FAILED.
+	'''
+
+	api_key = os.getenv( 'SENDGRID_API_KEY' )
+
+	if not api_key or not config.NOTIFY_EMAIL:
+		log.warning( 'SendGrid notification skipped — SENDGRID_API_KEY or NOTIFY_EMAIL not configured', extra={ 'job_id': job_id } )
+		return
+
+	message = Mail(
+		from_email = NOTIFICATION_FROM_EMAIL,
+		to_emails = config.NOTIFY_EMAIL,
+		subject = f'Training job { job_id } { status.lower() }',
+		html_content = f'<p>Training job <strong>{ job_id }</strong> finished with status <strong>{ status }</strong>.</p>',
+	)
+
+	try:
+		SendGridAPIClient( api_key ).send( message )
+		log.info( 'Job completion email sent', extra={ 'job_id': job_id, 'status': status, 'recipient': config.NOTIFY_EMAIL } )
+	except Exception as exc:
+		log.error( 'Job completion email failed to send', extra={ 'job_id': job_id, 'error': str( exc ) } )

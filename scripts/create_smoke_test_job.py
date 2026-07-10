@@ -21,13 +21,18 @@ def main() -> None:
 	now = datetime.now( timezone.utc )
 	job_id = f'train_{ now.strftime( "%Y%m%d_%H%M%S" ) }'
 
+	# Task 5.5 memory-mitigation amendment — max_samples_per_split=500, batch_size=8 gives
+	# ceil(500/8)=63 steps/epoch, enough sustained iteration to actually exercise the
+	# allocator-fragmentation path that a 2-step run (the old max_samples_per_split=10)
+	# never triggered, without running the full production dataset.
 	smoke_test_config = ExperimentConfig(
 		backbone = 'xception',
 		img_size = 299,
 		use_patch_pipeline = True,
-		max_samples_per_split = 10,
+		max_samples_per_split = 500,
 		ensemble_size = 1,
-		epochs = 1,
+		epochs = 2,
+		batch_size = 8,
 		early_stopping_patience = 1,
 		adversarial_training = True,
 		dataset_path = config.GCS_DATASET_PATH,
