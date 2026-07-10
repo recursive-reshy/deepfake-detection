@@ -1,4 +1,5 @@
 # Standard library
+import gc
 import logging
 # TensorFlow
 import tensorflow as tf
@@ -93,3 +94,14 @@ def fine_tune_with_fgsm( model: tf.keras.Model, batches, learning_rate: float, e
 		optimizer.apply_gradients( zip( gradients, model.trainable_variables ) )
 
 		log.info( f'Adversarial fine-tuning step { step } — loss={ float( loss ):.4f}' )
+
+		# Explicit cleanup (Task 5.6 memory-mitigation amendment) — same discipline as
+		# build_batches()/preprocess_image()'s Tier 1 cleanup, applied here too since this
+		# loop hits the identical per-image patch-materialization cost a second time (via
+		# `batches`, train.py's train_generator() reused for fine-tuning) on top of
+		# base training's own resident state, plus this loop's own per-step tensors
+		# (mixed_images, predictions, gradients, the GradientTape's captured graph) that a
+		# raw eager GradientTape loop doesn't get the same buffer-reuse Keras's compiled
+		# model.fit() path gets for free.
+		del images, labels, sample_weight, mixed_images, predictions, gradients, tape
+		gc.collect()

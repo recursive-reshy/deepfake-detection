@@ -233,7 +233,6 @@ def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, 
 	with tempfile.TemporaryDirectory() as tmp_dir:
 		log_csv_path = f'{ tmp_dir }/member_{ member_index }.csv'
 		checkpoint_path = f'{ tmp_dir }/member_{ member_index }.keras'
-		adversarial_checkpoint_path = f'{ tmp_dir }/member_{ member_index }_adversarial.keras'
 
 		callbacks = [
 			tf.keras.callbacks.EarlyStopping(
@@ -261,28 +260,12 @@ def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, 
 		with open( log_csv_path, 'rb' ) as f:
 			log_csv_bytes = f.read()
 
-		adversarial_checkpoint_bytes = None
-
-		# FGSM fine-tuning (5.6) — per member, after that member's own initial training
-		# converges, never on the fused ensemble output (System Architecture Doc 9.5).
-		# Saved as a *separate* checkpoint (not an overwrite of checkpoint_path above) —
-		# Phase 6 Stage 1 evaluation needs the pre-adversarial model's clean accuracy,
-		# Stage 2 needs this adversarially-fine-tuned one; overwriting would destroy the
-		# one Stage 1 needs.
-		if experiment.adversarial_training:
-			log.info( 'Starting adversarial fine-tuning', extra={
-				'job_id': job_id, 'ensemble_member': member_index, 'epsilon': experiment.adversarial_epsilon,
-			} )
-
-			fine_tune_with_fgsm( model, train_generator(), experiment.learning_rate, experiment.adversarial_epsilon )
-
-			model.save( adversarial_checkpoint_path )
-
-			with open( adversarial_checkpoint_path, 'rb' ) as f:
-				adversarial_checkpoint_bytes = f.read()
-
-			log.info( 'Adversarial fine-tuning complete', extra={ 'job_id': job_id, 'ensemble_member': member_index } )
-
+	# Pre-adversarial checkpoint + log uploaded and released *before* fine-tuning starts
+	# (Task 5.6 memory-mitigation amendment) — previously both checkpoint byte-blobs were
+	# held simultaneously in memory across one tempdir scope spanning both base training
+	# and fine-tuning, uploaded only after fine-tuning finished. Uploading and dropping
+	# checkpoint_bytes/log_csv_bytes here, before fine-tuning even starts, turns that into
+	# two sequential checkpoint-sized allocations instead of two simultaneous ones.
 	checkpoint_uri = f'gs://{ config.GCS_BUCKET }/checkpoints/{ job_id }/member_{ member_index }.keras'
 	upload_bytes_to_blob( checkpoint_uri, checkpoint_bytes )
 	log.info( 'Checkpoint uploaded', extra={ 'job_id': job_id, 'ensemble_member': member_index, 'checkpoint_uri': checkpoint_uri } )
@@ -291,12 +274,50 @@ def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, 
 	upload_bytes_to_blob( log_csv_uri, log_csv_bytes )
 	log.info( 'Training log uploaded', extra={ 'job_id': job_id, 'ensemble_member': member_index, 'log_csv_uri': log_csv_uri } )
 
-	if adversarial_checkpoint_bytes is not None:
+	del checkpoint_bytes
+	del log_csv_bytes
+	gc.collect()
+
+	# FGSM fine-tuning (5.6) — per member, after that member's own initial training
+	# converges, never on the fused ensemble output (System Architecture Doc 9.5). Saved
+	# as a *separate* checkpoint (not an overwrite of the one just uploaded above) — Phase
+	# 6 Stage 1 evaluation needs the pre-adversarial model's clean accuracy, Stage 2 needs
+	# this adversarially-fine-tuned one; overwriting would destroy the one Stage 1 needs.
+	if experiment.adversarial_training:
+
+		# Release base-training's optimizer state before fine-tuning starts (Task 5.6
+		# amendment) — model.compile() above left Adam's per-variable momentum/variance
+		# accumulators resident in model.optimizer; fine_tune_with_fgsm() below builds its
+		# own fresh optimizer rather than reusing this one (a distinct phase, not a
+		# continuation — see adversarial.py's docstring), so the old one is dead weight
+		# otherwise. Verified this doesn't break inference or model.save() afterward — the
+		# checkpoints here never needed the base-training optimizer's state anyway.
+		model.optimizer = None
+		gc.collect()
+
+		log.info( 'Starting adversarial fine-tuning', extra={
+			'job_id': job_id, 'ensemble_member': member_index, 'epsilon': experiment.adversarial_epsilon,
+		} )
+
+		fine_tune_with_fgsm( model, train_generator(), experiment.learning_rate, experiment.adversarial_epsilon )
+
+		log.info( 'Adversarial fine-tuning complete', extra={ 'job_id': job_id, 'ensemble_member': member_index } )
+
+		with tempfile.TemporaryDirectory() as adversarial_tmp_dir:
+			adversarial_checkpoint_path = f'{ adversarial_tmp_dir }/member_{ member_index }_adversarial.keras'
+			model.save( adversarial_checkpoint_path )
+
+			with open( adversarial_checkpoint_path, 'rb' ) as f:
+				adversarial_checkpoint_bytes = f.read()
+
 		adversarial_checkpoint_uri = f'gs://{ config.GCS_BUCKET }/checkpoints/{ job_id }/member_{ member_index }_adversarial.keras'
 		upload_bytes_to_blob( adversarial_checkpoint_uri, adversarial_checkpoint_bytes )
 		log.info( 'Adversarial checkpoint uploaded', extra={
 			'job_id': job_id, 'ensemble_member': member_index, 'checkpoint_uri': adversarial_checkpoint_uri,
 		} )
+
+		del adversarial_checkpoint_bytes
+		gc.collect()
 
 
 def main() -> None:
