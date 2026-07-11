@@ -12,7 +12,7 @@ class ExperimentConfig( BaseModel ):
 	patch_grid_size: int = 9
 	img_size: int = 299
 
-	batch_size: int = 16
+	batch_size: int = 8
 	epochs: int = 30
 	learning_rate: float = Field( default = 0.0001, gt = 0 )
 	dropout_rate: float = Field( default = 0.5, ge = 0, le = 1 )
