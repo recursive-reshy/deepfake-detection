@@ -19,6 +19,16 @@ dependencies = [
 	"pyyaml>=6.0.3",
 	"scikit-learn~=1.4",
 	"sendgrid>=6.12.5",
-	"tensorflow[and-cuda]>=2.21.0",
+	# Kept as a uv-managed dependency deliberately, even though the Dockerfile's base image
+	# (tensorflow/tensorflow:2.21.0-gpu) already ships a system-installed TensorFlow —
+	# uv run (both entrypoints, Cloud Run's uvicorn and Vertex AI's train.py) always
+	# executes against uv's own .venv, which is isolated from the base image's system
+	# site-packages, so the base image's bundled copy is never actually imported. Removing
+	# this would raise ModuleNotFoundError; it's not a duplicate/conflicting install in
+	# practice, only image-size overhead, because libcuda.so discovery (the thing the
+	# GPU base image actually fixes) happens at the OS/LD_LIBRARY_PATH level, outside of
+	# and unaffected by whichever Python environment TensorFlow's pip package resolves in.
+	"tensorflow[and-cuda]>=2.21.0; sys_platform == 'linux'",
+	"tensorflow>=2.21.0; sys_platform != 'linux'",
 	"uvicorn",
 ]
