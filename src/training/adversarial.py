@@ -6,6 +6,19 @@ import tensorflow as tf
 
 log = logging.getLogger( __name__ )
 
+# GPU-VRAM mitigation (fine-tuning-phase OOM amendment) — original-batch rows processed
+# per GradientTape in compute_fgsm_perturbation, not the full incoming batch at once. Each
+# row expands internally to patch_grid_size**2 patches once the caller's TimeDistributed
+# backbone runs (e.g. 8 rows * 81 patches = 648 images through XCeption in one tape, which
+# a real Vertex AI L4 run OOM'd on: Limit 20.34GiB, InUse 20.20GiB at crash time, inside
+# this exact function). The identically-sized forward+backward pass fits fine inside
+# model.fit()'s compiled training step (base training completes with no OOM at the same
+# batch_size), so the gap is this function's uncompiled, eager GradientTape not getting
+# that step's graph-level memory planning/buffer reuse — not a hard "648 patches" ceiling.
+# Independent of patch_grid_size — chunking happens on the original-image batch dimension,
+# before the caller's TimeDistributed reshape.
+FGSM_CHUNK_SIZE = 2
+
 
 def compute_fgsm_perturbation( model: tf.keras.Model, images: tf.Tensor, labels: tf.Tensor, sample_weight: tf.Tensor, epsilon: float ) -> tf.Tensor:
 	'''
@@ -25,20 +38,42 @@ def compute_fgsm_perturbation( model: tf.keras.Model, images: tf.Tensor, labels:
 	Clipped to [0, 1], matching preprocessor.py's own min-max-scaled output range for this
 	tensor (not [0, 255] — that range belongs to the raw pixel image, several steps
 	upstream of what this function perturbs).
+
+	Processed FGSM_CHUNK_SIZE original rows at a time (see module comment) rather than the
+	whole batch through one GradientTape. This is exact, not an approximation: FGSM only
+	needs sign(gradient), and binary_crossentropy's per-example loss terms don't couple
+	across examples, so sign(gradient) computed on a sub-batch is identical to sign(gradient)
+	computed within the full batch — reduce_mean's scaling constant is the only thing that
+	differs between chunk-local and full-batch averaging, and sign() is invariant to a
+	positive scaling constant. Splitting and concatenating the result changes peak memory
+	only, never the perturbation actually produced.
 	'''
 
 	images = tf.convert_to_tensor( images )
+	batch_size = images.shape[ 0 ]
+	perturbed_chunks = []
 
-	with tf.GradientTape() as tape:
-		tape.watch( images )
-		predictions = model( images, training=False )
-		loss = tf.keras.losses.binary_crossentropy( labels, predictions )
-		loss = tf.reduce_mean( loss * sample_weight )
+	for start in range( 0, batch_size, FGSM_CHUNK_SIZE ):
+		end = min( start + FGSM_CHUNK_SIZE, batch_size )
+		images_chunk = images[ start : end ]
 
-	gradient = tape.gradient( loss, images )
-	perturbation = epsilon * tf.sign( gradient )
+		with tf.GradientTape() as tape:
+			tape.watch( images_chunk )
+			predictions = model( images_chunk, training=False )
+			loss = tf.keras.losses.binary_crossentropy( labels[ start : end ], predictions )
+			loss = tf.reduce_mean( loss * sample_weight[ start : end ] )
 
-	return tf.clip_by_value( images + perturbation, 0.0, 1.0 )
+		gradient = tape.gradient( loss, images_chunk )
+		perturbation = epsilon * tf.sign( gradient )
+		perturbed_chunks.append( tf.clip_by_value( images_chunk + perturbation, 0.0, 1.0 ) )
+
+		del images_chunk, predictions, loss, gradient, tape
+
+	adversarial_images = tf.concat( perturbed_chunks, axis=0 )
+	del perturbed_chunks
+	gc.collect()
+
+	return adversarial_images
 
 
 def build_mixed_batch( model: tf.keras.Model, images: tf.Tensor, labels: tf.Tensor, sample_weight: tf.Tensor, epsilon: float ) -> tf.Tensor:
