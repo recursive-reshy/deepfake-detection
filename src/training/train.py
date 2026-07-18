@@ -43,6 +43,28 @@ logging.basicConfig( level=logging.INFO, handlers=[ handler ], force=True )
 
 log = logging.getLogger( __name__ )
 
+# GPU memory-growth configuration (fine-tuning-phase GPU-VRAM OOM amendment) — must run
+# before any other TF operation that touches a GPU device (model construction included),
+# since TF raises once physical devices are already initialized; nothing above this point
+# does. Default BFC behaviour claims a large upfront memory pool per process and doesn't
+# hand any of it back mid-process — the OOM evidence this responds to was a ~22MB
+# allocation failing on a 20GB GPU during fine-tuning, after base training's own compiled
+# tf.function graphs had already run at a different input shape (chunked FGSM forward
+# passes vs. base training's full-batch steps), which points at near-total pool exhaustion
+# left over from training rather than any single operation being too large (already ruled
+# out — see FGSM_CHUNK_SIZE in adversarial.py). Incremental growth trades this away for
+# allocating only what's actually requested, at the cost of not having the single big
+# pool's allocation-pattern predictability — an acceptable trade here since correctness
+# (not fitting in 20GB at all) matters more than that predictability.
+gpus = tf.config.experimental.list_physical_devices( 'GPU' )
+
+for gpu in gpus:
+	tf.config.experimental.set_memory_growth( gpu, True )
+
+log.info( 'GPU memory-growth configured', extra={
+	'gpu_count': len( gpus ), 'gpu_devices': [ gpu.name for gpu in gpus ],
+} )
+
 # FAKE is the positive class (target=1) — the natural framing for a deepfake detector.
 # Nothing else in the codebase pins this for the neural-net path (baseline.py's SVM path
 # keeps raw string labels throughout, sidestepping the question); binary_crossentropy
@@ -109,6 +131,35 @@ def build_batches( split_df, img_size: int, patch_grid_size: int, batch_size: in
 		del patches
 		del image
 		gc.collect()
+
+
+def log_gpu_memory( phase: str, job_id: str, member_index: int ) -> None:
+	'''
+	Best-effort GPU memory snapshot (current/peak allocated bytes), taken around
+	model.fit() and the cached-compiled-function release that follows it — added to
+	confirm or rule out the fine-tuning-phase OOM hypothesis (base training's compiled
+	tf.function graphs never releasing GPU memory back to the pool) directly from the
+	next real Vertex AI run's logs, rather than inferring it from a stack trace alone.
+
+	Silently skipped, never raises, if no GPU is visible (true on this dev machine) or if
+	get_memory_info doesn't recognise the device name — diagnostic only, must never break
+	an otherwise-working training step over a logging call.
+	'''
+
+	gpus = tf.config.list_physical_devices( 'GPU' )
+
+	if not gpus:
+		return
+
+	try:
+		memory_info = tf.config.experimental.get_memory_info( 'GPU:0' )
+	except ValueError:
+		return
+
+	log.info( 'GPU memory snapshot', extra={
+		'job_id': job_id, 'ensemble_member': member_index, 'phase': phase,
+		'current_bytes': memory_info[ 'current' ], 'peak_bytes': memory_info[ 'peak' ],
+	} )
 
 
 def build_patch_averaged_model( member_model: tf.keras.Model, patch_grid_size: int, img_size: int ) -> tf.keras.Model:
@@ -242,6 +293,8 @@ def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, 
 			FirestoreEpochCallback( job_id, member_index ),
 		]
 
+		log_gpu_memory( 'before_fit', job_id, member_index )
+
 		model.fit(
 			train_dataset,
 			validation_data = val_dataset,
@@ -251,6 +304,28 @@ def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, 
 			callbacks = callbacks,
 			verbose = 2,
 		)
+
+		log_gpu_memory( 'after_fit', job_id, member_index )
+
+		# Release model.fit()'s cached compiled tf.function graphs (fine-tuning-phase
+		# GPU-VRAM OOM amendment) — model.fit()/its validation_data pass trace and cache
+		# train_function/test_function shaped for this call's batch; TF's allocator claims
+		# GPU memory for their kernel workspace and doesn't hand it back on its own.
+		# Fine-tuning below calls this same model directly at a different input shape
+		# (FGSM's per-chunk forward/backward passes — see FGSM_CHUNK_SIZE in
+		# adversarial.py), needing its own headroom on top of whatever these cached graphs
+		# are still holding. Neither is needed again regardless of whether fine-tuning
+		# runs: this member's model.fit() call is already done, and fine_tune_with_fgsm()
+		# never calls .fit()/.evaluate(). Confirmed against Keras 3's own TensorFlow
+		# trainer (src/backend/tensorflow/trainer.py) — both attributes default to None
+		# and are lazily rebuilt via make_train_function()/make_test_function() the next
+		# time fit()/evaluate() is called, so this is the same reset the framework itself
+		# does, not an internals hack.
+		model.train_function = None
+		model.test_function = None
+		gc.collect()
+
+		log_gpu_memory( 'after_cached_function_release', job_id, member_index )
 
 		model.save( checkpoint_path )
 
