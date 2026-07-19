@@ -17,6 +17,8 @@ jobSpec:
           - src/training/train.py
           - --job-id
           - "{job_id}"
+          - --stage
+          - "{stage}"
         env:
           - name: GCP_PROJECT_ID
             value: deepfake-detection-ct0391

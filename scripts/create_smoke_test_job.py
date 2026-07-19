@@ -42,6 +42,7 @@ def main() -> None:
 		job_id = job_id,
 		stage = 'train',
 		status = 'PENDING',
+		training_stage = 'base_training',
 		config = smoke_test_config,
 		created_at = now,
 		updated_at = now,

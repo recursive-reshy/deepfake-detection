@@ -23,6 +23,7 @@ async def get_job_status( job_id: str ):
 	return {
 		'job_id': job.job_id,
 		'status': job.status,
+		'training_stage': job.training_stage,
 		'current_epoch': job.current_epoch,
 		'error': job.error,
 		'updated_at': job.updated_at.isoformat(),

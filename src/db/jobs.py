@@ -50,3 +50,43 @@ def update_job_progress( job_id: str, current_epoch: int ) -> None:
 		'current_epoch': current_epoch,
 		'updated_at': datetime.now( timezone.utc ),
 	} )
+
+def update_job_training_stage( job_id: str, training_stage: str ) -> None:
+	client = get_client()
+	job_ref = client.collection( JOBS_COLLECTION ).document( job_id )
+
+	job_ref.update( {
+		'training_stage': training_stage,
+		'updated_at': datetime.now( timezone.utc ),
+	} )
+
+def update_job_member_checkpoint( job_id: str, member_index: int, checkpoint_uri: str ) -> None:
+	client = get_client()
+	job_ref = client.collection( JOBS_COLLECTION ).document( job_id )
+
+	# Dotted field path — updates one key of the member_checkpoints map without touching
+	# the others, rather than overwriting the whole map (other members may still be
+	# training when this write happens).
+	job_ref.update( {
+		f'member_checkpoints.{ member_index }': checkpoint_uri,
+		'updated_at': datetime.now( timezone.utc ),
+	} )
+
+def update_job_member_adversarial_checkpoint( job_id: str, member_index: int, checkpoint_uri: str ) -> None:
+	client = get_client()
+	job_ref = client.collection( JOBS_COLLECTION ).document( job_id )
+
+	job_ref.update( {
+		f'member_adversarial_checkpoints.{ member_index }': checkpoint_uri,
+		'updated_at': datetime.now( timezone.utc ),
+	} )
+
+def update_job_vertex_job_id( job_id: str, stage: str, vertex_job_id: str ) -> None:
+	client = get_client()
+	job_ref = client.collection( JOBS_COLLECTION ).document( job_id )
+	field = f'vertex_job_id_{ stage }'
+
+	job_ref.update( {
+		field: vertex_job_id,
+		'updated_at': datetime.now( timezone.utc ),
+	} )

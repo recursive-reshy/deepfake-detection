@@ -32,6 +32,8 @@ from src.schemas.experiment import ExperimentConfig
 # Utils
 from src.utils.seed import set_global_seed
 from src.utils.gcs import upload_bytes_to_blob
+from src.utils.gcs import download_blob_to_bytes
+from src.utils.vertex import submit_vertex_job
 
 handler = logging.StreamHandler()
 handler.setFormatter( JsonFormatter(
@@ -185,18 +187,76 @@ def build_patch_averaged_model( member_model: tf.keras.Model, patch_grid_size: i
 	return tf.keras.Model( inputs=patch_input, outputs=image_score )
 
 
-def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, splits: dict, class_weights: dict ) -> None:
+def build_generators( experiment: ExperimentConfig, member_seed: int, splits: dict, class_weights: dict ):
 	'''
-	Build, train, optionally adversarially fine-tune, and persist one ensemble member —
-	extracted out of main()'s per-member loop (5.5) rather than kept inline, since it's now
-	called config.ensemble_size times instead of once (5.4's single-member scope). Every
-	side effect (Firestore epoch writes, GCS checkpoint/log upload) is tagged with
-	member_index, so members never overwrite each other's records or artefacts.
+	Shared by both stages — train_member_base() wraps these in tf.data.Dataset for
+	model.fit(); train_member_adversarial() calls train_generator() directly as
+	fine_tune_with_fgsm()'s raw batch iterable (fine-tuning was never wrapped in
+	tf.data.Dataset, even before the two-stage split). Same member_seed-derived
+	augmentation-seed sequencing in both stages, so a given member_index draws from the
+	same seeded augmentation stream regardless of which stage calls this.
 
-	Raises straight through on any failure — main()'s outer try/except is what turns one
-	member's exception into the whole job's FAILED status; this function doesn't swallow
-	errors to let sibling members continue, per 5.5's requirement that one member failing
-	fails the whole job rather than silently completing with fewer members than requested.
+	train_epoch_counter always starts fresh at 0 whenever this is called. In Stage 2 (a
+	separate process from Stage 1) that means fine-tuning's single pass reuses the same
+	augmentation_seed as Stage 1's first base-training epoch, rather than continuing the
+	sequence Stage 1 left off at (only possible for the in-process version, before this
+	split, since the counter lived in the same Python object across both phases). Accepted
+	as a minor, deliberate behaviour change: FGSM's perturbation is computed fresh from the
+	model's current (post-base-training) gradients regardless of which valid augmented
+	version of an image it's given, so this only affects augmentation-sequence novelty, not
+	correctness.
+
+	class_weight, keyed by the model's own {0.0, 1.0} target encoding rather than the raw
+	label strings splitter.py computed it from. sample_weight (not model.fit's
+	class_weight= kwarg) carries the class balancing — class_weight's support alongside a
+	tf.data.Dataset input varies across Keras versions, while sample_weight as a third
+	yielded array is universally supported for any input type. Only the training stream is
+	weighted; validation intentionally is not, so val_loss reflects the real, unweighted
+	loss.
+	'''
+
+	numeric_class_weights = { LABEL_TO_TARGET[ label ]: weight for label, weight in class_weights.items() }
+	train_epoch_counter = { 'value': 0 }
+
+	def train_generator():
+		seed_for_epoch = member_seed + train_epoch_counter[ 'value' ]
+		train_epoch_counter[ 'value' ] += 1
+
+		for images, labels in build_batches(
+			splits[ 'train' ], experiment.img_size, experiment.patch_grid_size,
+			experiment.batch_size, augment=True, shuffle=True, augmentation_seed=seed_for_epoch,
+		):
+			sample_weight = np.array( [ numeric_class_weights[ label ] for label in labels ], dtype=np.float32 )
+
+			yield images, labels, sample_weight
+
+	def val_generator():
+		yield from build_batches(
+			splits[ 'val' ], experiment.img_size, experiment.patch_grid_size,
+			experiment.batch_size, augment=False, shuffle=False,
+		)
+
+	return train_generator, val_generator
+
+
+def train_member_base( experiment: ExperimentConfig, job_id: str, member_index: int, splits: dict, class_weights: dict ) -> None:
+	'''
+	Stage 1 worker — build, base-train, and persist one ensemble member's checkpoint. Never
+	runs adversarial fine-tuning itself: the two-stage split (see run_base_stage /
+	run_adversarial_stage below) moved that to a separate Vertex AI job so it always starts
+	in a fresh container. In-process cleanup between base training and fine-tuning
+	(model.optimizer = None, train_function/test_function release, GPU memory-growth) was
+	tried first and wasn't reliable enough to depend on — the allocator dump from the real
+	OOM this responds to showed LargestFreeBlock: 0B at the moment fine-tuning issued its
+	first op, meaning base training's own retained graph state had already saturated the
+	pool before fine-tuning got a chance to request anything.
+
+	The train_function/test_function/optimizer release below still matters here, just for a
+	different transition than before this split — member-to-member within this same
+	stage/process, not base-to-adversarial (that boundary is now a process exit).
+
+	Raises straight through on any failure, same as before the split — one member's
+	exception still fails the whole Stage 1 job (see run_base_stage).
 	'''
 
 	member_seed = set_global_seed( experiment.random_seed + member_index )
@@ -217,43 +277,7 @@ def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, 
 		metrics = [ 'accuracy' ],
 	)
 
-	# class_weight, keyed by the model's own {0.0, 1.0} target encoding rather than the
-	# raw label strings splitter.py computed it from
-	numeric_class_weights = { LABEL_TO_TARGET[ label ]: weight for label, weight in class_weights.items() }
-
-	# tf.data wrapping — the seam 3.9's build_batches docstring already flagged for
-	# "once there's a model to feed" (there is, now). A plain Python generator is
-	# exhausted after one pass; .repeat() re-invokes the factory functions below each
-	# epoch to get a fresh pass. train's factory closes over a mutable counter so
-	# successive epochs get a distinct-but-deterministic augmentation_seed
-	# (member_seed + epoch index) — reruns of the whole job are reproducible (same
-	# member_seed -> same per-epoch seed sequence), while different epochs within one
-	# run still see different augmentations, not the same one repeated every epoch.
-	#
-	# sample_weight (not model.fit's class_weight= kwarg) carries the class balancing —
-	# class_weight's support alongside a tf.data.Dataset input varies across Keras
-	# versions, while sample_weight as a third yielded array is universally supported
-	# for any input type. Only the training stream is weighted; validation intentionally
-	# is not, so val_loss reflects the real, unweighted loss.
-	train_epoch_counter = { 'value': 0 }
-
-	def train_generator():
-		seed_for_epoch = member_seed + train_epoch_counter[ 'value' ]
-		train_epoch_counter[ 'value' ] += 1
-
-		for images, labels in build_batches(
-			splits[ 'train' ], experiment.img_size, experiment.patch_grid_size,
-			experiment.batch_size, augment=True, shuffle=True, augmentation_seed=seed_for_epoch,
-		):
-			sample_weight = np.array( [ numeric_class_weights[ label ] for label in labels ], dtype=np.float32 )
-
-			yield images, labels, sample_weight
-
-	def val_generator():
-		yield from build_batches(
-			splits[ 'val' ], experiment.img_size, experiment.patch_grid_size,
-			experiment.batch_size, augment=False, shuffle=False,
-		)
+	train_generator, val_generator = build_generators( experiment, member_seed, splits, class_weights )
 
 	patch_count = experiment.patch_grid_size ** 2
 	image_spec = tf.TensorSpec( shape=( None, patch_count, experiment.img_size, experiment.img_size, 3 ), dtype=tf.float32 )
@@ -323,6 +347,7 @@ def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, 
 		# does, not an internals hack.
 		model.train_function = None
 		model.test_function = None
+		model.optimizer = None
 		gc.collect()
 
 		log_gpu_memory( 'after_cached_function_release', job_id, member_index )
@@ -335,14 +360,9 @@ def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, 
 		with open( log_csv_path, 'rb' ) as f:
 			log_csv_bytes = f.read()
 
-	# Pre-adversarial checkpoint + log uploaded and released *before* fine-tuning starts
-	# (Task 5.6 memory-mitigation amendment) — previously both checkpoint byte-blobs were
-	# held simultaneously in memory across one tempdir scope spanning both base training
-	# and fine-tuning, uploaded only after fine-tuning finished. Uploading and dropping
-	# checkpoint_bytes/log_csv_bytes here, before fine-tuning even starts, turns that into
-	# two sequential checkpoint-sized allocations instead of two simultaneous ones.
 	checkpoint_uri = f'gs://{ config.GCS_BUCKET }/checkpoints/{ job_id }/member_{ member_index }.keras'
 	upload_bytes_to_blob( checkpoint_uri, checkpoint_bytes )
+	jobs.update_job_member_checkpoint( job_id, member_index, checkpoint_uri )
 	log.info( 'Checkpoint uploaded', extra={ 'job_id': job_id, 'ensemble_member': member_index, 'checkpoint_uri': checkpoint_uri } )
 
 	log_csv_uri = f'gs://{ config.GCS_BUCKET }/logs/{ job_id }/member_{ member_index }.csv'
@@ -353,58 +373,183 @@ def train_member( experiment: ExperimentConfig, job_id: str, member_index: int, 
 	del log_csv_bytes
 	gc.collect()
 
-	# FGSM fine-tuning (5.6) — per member, after that member's own initial training
-	# converges, never on the fused ensemble output (System Architecture Doc 9.5). Saved
-	# as a *separate* checkpoint (not an overwrite of the one just uploaded above) — Phase
-	# 6 Stage 1 evaluation needs the pre-adversarial model's clean accuracy, Stage 2 needs
-	# this adversarially-fine-tuned one; overwriting would destroy the one Stage 1 needs.
-	if experiment.adversarial_training:
 
-		# Release base-training's optimizer state before fine-tuning starts (Task 5.6
-		# amendment) — model.compile() above left Adam's per-variable momentum/variance
-		# accumulators resident in model.optimizer; fine_tune_with_fgsm() below builds its
-		# own fresh optimizer rather than reusing this one (a distinct phase, not a
-		# continuation — see adversarial.py's docstring), so the old one is dead weight
-		# otherwise. Verified this doesn't break inference or model.save() afterward — the
-		# checkpoints here never needed the base-training optimizer's state anyway.
-		model.optimizer = None
+def train_member_adversarial( experiment: ExperimentConfig, job_id: str, member_index: int, checkpoint_uri: str, splits: dict, class_weights: dict ) -> None:
+	'''
+	Stage 2 worker — reload one ensemble member's base-trained checkpoint fresh from GCS
+	(this always runs in a brand-new process/container, never the one that ran Stage 1 —
+	see run_adversarial_stage), FGSM fine-tune it, upload the adversarial checkpoint as a
+	*separate* artefact from the pre-adversarial one (Phase 6 Stage 1 evaluation needs the
+	pre-adversarial model's clean accuracy, Stage 2 needs this one; overwriting would
+	destroy the one Stage 1 needs — same reasoning as before the two-stage split).
+
+	Reconstructs the architecture via build_backbone/build_head/build_patch_averaged_model
+	and loads only the weights (model.load_weights), rather than
+	tf.keras.models.load_model() on the full .keras archive — build_patch_averaged_model's
+	Lambda layer needs safe_mode=False to deserialize via load_model, since Keras 3 treats
+	arbitrary Lambda function bytecode as unsafe to deserialize by default. Reconstructing
+	the (already-known, already-tested) architecture and loading weights only sidesteps
+	that, no safe_mode override needed. Verified robust to Keras's auto-generated layer
+	names differing between the checkpoint's original build and this fresh one (which they
+	will, across members processed in one Stage 2 loop, since Keras's naming counter keeps
+	incrementing within one process) — load_weights() on a .keras file matches by
+	topological order, not by name.
+
+	clear_session() at the start resets Keras's global layer-naming counters and releases
+	the previous member's graph/session state — memory hygiene for the member-to-member
+	loop within this stage, mirroring train_member_base()'s own between-member cleanup.
+	'''
+
+	tf.keras.backend.clear_session()
+
+	member_seed = set_global_seed( experiment.random_seed + member_index )
+	log.info( 'Ensemble member seeded for adversarial fine-tuning', extra={
+		'job_id': job_id, 'ensemble_member': member_index, 'seed': member_seed,
+	} )
+
+	backbone = build_backbone( experiment )
+	head_output = build_head( backbone.output, experiment )
+	member_model = tf.keras.Model( inputs=backbone.input, outputs=head_output )
+	model = build_patch_averaged_model( member_model, experiment.patch_grid_size, experiment.img_size )
+
+	with tempfile.TemporaryDirectory() as tmp_dir:
+		local_checkpoint_path = f'{ tmp_dir }/member_{ member_index }.keras'
+		checkpoint_bytes = download_blob_to_bytes( checkpoint_uri )
+
+		with open( local_checkpoint_path, 'wb' ) as f:
+			f.write( checkpoint_bytes )
+
+		del checkpoint_bytes
 		gc.collect()
 
-		log.info( 'Starting adversarial fine-tuning', extra={
-			'job_id': job_id, 'ensemble_member': member_index, 'epsilon': experiment.adversarial_epsilon,
+		model.load_weights( local_checkpoint_path )
+
+	log.info( 'Checkpoint loaded from GCS', extra={ 'job_id': job_id, 'ensemble_member': member_index, 'checkpoint_uri': checkpoint_uri } )
+
+	train_generator, _ = build_generators( experiment, member_seed, splits, class_weights )
+
+	log_gpu_memory( 'before_finetune', job_id, member_index )
+
+	log.info( 'Starting adversarial fine-tuning', extra={
+		'job_id': job_id, 'ensemble_member': member_index, 'epsilon': experiment.adversarial_epsilon,
+	} )
+
+	fine_tune_with_fgsm( model, train_generator(), experiment.learning_rate, experiment.adversarial_epsilon )
+
+	log.info( 'Adversarial fine-tuning complete', extra={ 'job_id': job_id, 'ensemble_member': member_index } )
+
+	log_gpu_memory( 'after_finetune', job_id, member_index )
+
+	with tempfile.TemporaryDirectory() as adversarial_tmp_dir:
+		adversarial_checkpoint_path = f'{ adversarial_tmp_dir }/member_{ member_index }_adversarial.keras'
+		model.save( adversarial_checkpoint_path )
+
+		with open( adversarial_checkpoint_path, 'rb' ) as f:
+			adversarial_checkpoint_bytes = f.read()
+
+	adversarial_checkpoint_uri = f'gs://{ config.GCS_BUCKET }/checkpoints/{ job_id }/member_{ member_index }_adversarial.keras'
+	upload_bytes_to_blob( adversarial_checkpoint_uri, adversarial_checkpoint_bytes )
+	jobs.update_job_member_adversarial_checkpoint( job_id, member_index, adversarial_checkpoint_uri )
+	log.info( 'Adversarial checkpoint uploaded', extra={
+		'job_id': job_id, 'ensemble_member': member_index, 'checkpoint_uri': adversarial_checkpoint_uri,
+	} )
+
+	del adversarial_checkpoint_bytes
+	gc.collect()
+
+
+def run_base_stage( experiment: ExperimentConfig, job_id: str, splits: dict, class_weights: dict ) -> None:
+	'''
+	Stage 1: base-train every ensemble member, then either finish the job outright
+	(adversarial_training=False — this job never wanted a Stage 2 at all, mirroring the
+	pre-split code's own `if experiment.adversarial_training:` gate) or self-submit Stage 2
+	as a brand-new Vertex AI job and return, leaving that job to finish things. Sequential,
+	not parallel, across members — single GPU, no need to complicate this. Each member is
+	fully independent (own seed, own augmentation stream, own checkpoint/log path — see
+	train_member_base()'s docstring); an exception from any member propagates straight out
+	of this function to main()'s except block, so one member failing fails the whole Stage
+	1 job rather than silently completing with fewer members than requested.
+	'''
+
+	jobs.update_job_training_stage( job_id, 'base_training' )
+
+	for member_index in range( experiment.ensemble_size ):
+		train_member_base( experiment, job_id, member_index, splits, class_weights )
+
+	log.info( 'Base training complete for all members', extra={
+		'job_id': job_id, 'ensemble_size': experiment.ensemble_size,
+	} )
+
+	if not experiment.adversarial_training:
+		jobs.update_job_training_stage( job_id, 'complete' )
+		jobs.update_job_status( job_id, 'COMPLETED' )
+		send_job_completion_email( job_id, 'COMPLETED' )
+		log.info( 'adversarial_training disabled — job finished after Stage 1', extra={ 'job_id': job_id } )
+		return
+
+	try:
+		vertex_job_id = submit_vertex_job( job_id, 'adversarial' )
+		jobs.update_job_vertex_job_id( job_id, 'adversarial', vertex_job_id )
+		jobs.update_job_training_stage( job_id, 'adversarial_finetuning' )
+		log.info( 'Stage 2 (adversarial fine-tuning) submitted', extra={
+			'job_id': job_id, 'vertex_job_id': vertex_job_id,
 		} )
 
-		fine_tune_with_fgsm( model, train_generator(), experiment.learning_rate, experiment.adversarial_epsilon )
+	except Exception as exc:
+		# Base training itself succeeded — every member's checkpoint is already uploaded
+		# and durable in GCS. Only the Stage 2 submission call failed (transient GCP API
+		# error, quota, etc.), so this gets a status distinct from FAILED: training didn't
+		# fail, the automatic hand-off to Stage 2 did. Deliberately not re-raised — letting
+		# this propagate to main()'s generic except block below would overwrite this more
+		# specific status with plain FAILED, losing exactly the distinction this exists to
+		# make. A manual re-submission path (reusing these checkpoints, no retraining
+		# needed) is flagged as a follow-up, not built here — see the handoff brief this
+		# responds to.
+		jobs.update_job_error( job_id, str( exc ) )
+		jobs.update_job_status( job_id, 'STAGE2_SUBMISSION_FAILED' )
+		send_job_completion_email( job_id, 'STAGE2_SUBMISSION_FAILED' )
+		log.exception( 'Stage 2 submission failed after Stage 1 completed successfully', extra={ 'job_id': job_id } )
 
-		log.info( 'Adversarial fine-tuning complete', extra={ 'job_id': job_id, 'ensemble_member': member_index } )
 
-		with tempfile.TemporaryDirectory() as adversarial_tmp_dir:
-			adversarial_checkpoint_path = f'{ adversarial_tmp_dir }/member_{ member_index }_adversarial.keras'
-			model.save( adversarial_checkpoint_path )
+def run_adversarial_stage( experiment: ExperimentConfig, job_id: str, member_checkpoints: dict, splits: dict, class_weights: dict ) -> None:
+	'''
+	Stage 2: reload each member's checkpoint fresh from GCS (a separate process from Stage
+	1 — nothing survives a process exit, which is the whole point of this split), FGSM
+	fine-tune, upload the adversarial checkpoint. Which members exist and where to load
+	them from comes from member_checkpoints (the job document's own field, written by Stage
+	1) — never from CLI args/env vars, per the two-stage split's Firestore-only hand-off
+	design. An exception from any member propagates straight out of this function to
+	main()'s except block, same failure semantics as Stage 1.
+	'''
 
-			with open( adversarial_checkpoint_path, 'rb' ) as f:
-				adversarial_checkpoint_bytes = f.read()
+	jobs.update_job_training_stage( job_id, 'adversarial_finetuning' )
 
-		adversarial_checkpoint_uri = f'gs://{ config.GCS_BUCKET }/checkpoints/{ job_id }/member_{ member_index }_adversarial.keras'
-		upload_bytes_to_blob( adversarial_checkpoint_uri, adversarial_checkpoint_bytes )
-		log.info( 'Adversarial checkpoint uploaded', extra={
-			'job_id': job_id, 'ensemble_member': member_index, 'checkpoint_uri': adversarial_checkpoint_uri,
-		} )
+	if not member_checkpoints:
+		raise RuntimeError( f'No member checkpoints found on job { job_id } — Stage 2 cannot run before Stage 1 has uploaded at least one' )
 
-		del adversarial_checkpoint_bytes
-		gc.collect()
+	for member_index_str, checkpoint_uri in member_checkpoints.items():
+		train_member_adversarial( experiment, job_id, int( member_index_str ), checkpoint_uri, splits, class_weights )
+
+	jobs.update_job_training_stage( job_id, 'complete' )
+	jobs.update_job_status( job_id, 'COMPLETED' )
+	send_job_completion_email( job_id, 'COMPLETED' )
+	log.info( 'Adversarial fine-tuning complete for all members — job finished', extra={ 'job_id': job_id } )
 
 
 def main() -> None:
 
 	parser = argparse.ArgumentParser()
 	parser.add_argument( '--job-id', required=True )
+	parser.add_argument( '--stage', required=True, choices=[ 'base', 'adversarial' ] )
 	args = parser.parse_args()
 
 	job_id = args.job_id
+	stage = args.stage
 
 	# Fetch job document — config comes from Firestore (written by POST /train), never
-	# re-parsed from CLI args, per Section 7.4 step 6 of the architecture doc
+	# re-parsed from CLI args, per Section 7.4 step 6 of the architecture doc. Stage 2
+	# additionally depends on this same read to discover member_checkpoints, written by
+	# Stage 1's own run in a separate process/container.
 	job = jobs.get_job( job_id )
 
 	if job is None:
@@ -412,12 +557,14 @@ def main() -> None:
 		sys.exit( 1 )
 
 	jobs.update_job_status( job_id, 'RUNNING' )
-	log.info( 'Training job started', extra={ 'job_id': job_id } )
+	log.info( 'Training job started', extra={ 'job_id': job_id, 'stage': stage } )
 
 	experiment = job.config
 
 	try:
-		# Manifest + split
+		# Manifest + split — reloaded independently by whichever stage is running. Stage 2
+		# can't reuse Stage 1's in-memory splits (separate process), only job.config, which
+		# is identical either way since both stages read the same Firestore job_id.
 		manifest_uri = f'gs://{ config.GCS_BUCKET }/{ experiment.dataset_path }'
 		manifest = load_manifest( manifest_uri, experiment.max_samples_per_split )
 		log.info( 'Manifest loaded', extra={ 'job_id': job_id, 'rows': len( manifest ) } )
@@ -431,26 +578,19 @@ def main() -> None:
 			'test_rows': len( splits[ 'test' ] ),
 		} )
 
-		# Ensemble loop (5.5) — sequential, not parallel (single GPU, no need to complicate
-		# this). Each member is fully independent (own seed, own augmentation stream, own
-		# checkpoint/log path — see train_member()'s docstring); an exception from any
-		# member propagates straight to the except block below rather than being caught
-		# per-member, so one failure fails the whole job instead of silently completing
-		# with fewer members than config.ensemble_size requested.
-		for member_index in range( experiment.ensemble_size ):
-			train_member( experiment, job_id, member_index, splits, class_weights )
-
-		jobs.update_job_status( job_id, 'COMPLETED' )
-		send_job_completion_email( job_id, 'COMPLETED' )
+		if stage == 'base':
+			run_base_stage( experiment, job_id, splits, class_weights )
+		else:
+			run_adversarial_stage( experiment, job_id, job.member_checkpoints, splits, class_weights )
 
 	except Exception as exc:
 		jobs.update_job_error( job_id, str( exc ) )
 		jobs.update_job_status( job_id, 'FAILED' )
 		send_job_completion_email( job_id, 'FAILED' )
-		log.exception( 'Training pipeline failed', extra={ 'job_id': job_id } )
+		log.exception( 'Training pipeline failed', extra={ 'job_id': job_id, 'stage': stage } )
 		sys.exit( 1 )
 
-	log.info( 'Training job complete', extra={ 'job_id': job_id } )
+	log.info( 'Training job process complete', extra={ 'job_id': job_id, 'stage': stage } )
 
 
 if __name__ == '__main__':

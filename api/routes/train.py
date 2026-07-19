@@ -2,20 +2,16 @@
 import logging
 from datetime import datetime
 from datetime import timezone
-# YAML
-import yaml
 # FastAPI
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-# Vertex AI
-from google.cloud import aiplatform
-# Config
-import config
 # Schemas
 from src.schemas.experiment import ExperimentConfig
 from src.schemas.db import JobDocument
 # DB
 from src.db import jobs
+# Utils
+from src.utils.vertex import submit_vertex_job
 
 router = APIRouter()
 
@@ -28,66 +24,24 @@ async def submit_training_job( payload: ExperimentConfig ):
 	now = datetime.now( timezone.utc )
 	job_id = f'train_{ now.strftime( "%Y%m%d_%H%M%S" ) }'
 
-	# Write PENDING job to Firestore
+	# Write PENDING job to Firestore — every submission starts at Stage 1 (base training);
+	# train.py's own Stage 1 -> Stage 2 hand-off (see run_base_stage) is what moves
+	# training_stage on from here, never this route.
 	job_doc = JobDocument(
 		job_id = job_id,
 		stage = 'train',
 		status = 'PENDING',
+		training_stage = 'base_training',
 		config = payload,
 		created_at = now,
 		updated_at = now,
 	)
 	jobs.create_job( job_doc )
 
-	# Load and substitute YAML template
-	with open( 'infra/vertex_job.yaml' ) as f:
-		spec_text = f.read()
-
-	spec_text = spec_text \
-		.replace( '{job_id}', job_id ) \
-		.replace( '{image_uri}', config.IMAGE_URI or '' )
-
-	spec = yaml.safe_load( spec_text )
-
-	# Build worker pool specs in snake_case (Vertex AI SDK format)
-	raw_pools = spec[ 'jobSpec' ][ 'workerPoolSpecs' ]
-
-	worker_pool_specs = [
-		{
-			'machine_spec': {
-				'machine_type': pool[ 'machineSpec' ][ 'machineType' ],
-				**(
-					{
-						'accelerator_type': pool[ 'machineSpec' ][ 'acceleratorType' ],
-						'accelerator_count': pool[ 'machineSpec' ][ 'acceleratorCount' ],
-					}
-					if 'acceleratorType' in pool[ 'machineSpec' ] else {}
-				),
-			},
-			'replica_count':  pool[ 'replicaCount' ],
-			'container_spec': {
-				'image_uri': pool[ 'containerSpec' ][ 'imageUri' ],
-				'command': pool[ 'containerSpec' ][ 'command' ],
-				'args': pool[ 'containerSpec' ][ 'args' ],
-				'env': [
-					{ 'name': e[ 'name' ], 'value': e[ 'value' ] }
-					for e in pool[ 'containerSpec' ].get( 'env', [] )
-				],
-			},
-		}
-		for pool in raw_pools
-	]
-
-	# Submit to Vertex AI
+	# Submit Stage 1 (base training) to Vertex AI
 	try:
-		aiplatform.init( project=config.GCP_PROJECT_ID, location=config.GCP_REGION )
-
-		custom_job = aiplatform.CustomJob(
-			display_name = spec[ 'displayName' ],
-			worker_pool_specs = worker_pool_specs,
-			staging_bucket = f"gs://{ config.GCS_BUCKET }"
-		)
-		custom_job.submit()
+		vertex_job_id = submit_vertex_job( job_id, 'base' )
+		jobs.update_job_vertex_job_id( job_id, 'base', vertex_job_id )
 
 	except Exception as exc:
 		jobs.update_job_error( job_id, str( exc ) )
