@@ -12,6 +12,8 @@ jobSpec:
         command:
           - uv
           - run
+          - --frozen
+          - --no-dev
           - python
         args:
           - src/training/train.py
