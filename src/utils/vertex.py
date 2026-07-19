@@ -1,9 +1,13 @@
+# Standard library
+import logging
 # YAML
 import yaml
 # Vertex AI
 from google.cloud import aiplatform
 # Config
 import config
+
+log = logging.getLogger( __name__ )
 
 
 def submit_vertex_job( job_id: str, stage: str ) -> str:
@@ -61,6 +65,14 @@ def submit_vertex_job( job_id: str, stage: str ) -> str:
 		}
 		for pool in raw_pools
 	]
+
+	# Log the literal command/args/worker_pool_specs actually being submitted (not the
+	# source YAML) — this is the payload the CustomJob API receives, so a template-vs-
+	# submission drift (e.g. a fix landing in infra/vertex_job.yaml but a stale cached
+	# spec still going out) is visible from this job's own log, not just a repo diff.
+	log.info( 'Submitting Vertex AI CustomJob', extra={
+		'job_id': job_id, 'stage': stage, 'worker_pool_specs': worker_pool_specs,
+	} )
 
 	aiplatform.init( project=config.GCP_PROJECT_ID, location=config.GCP_REGION )
 
