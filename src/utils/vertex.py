@@ -10,21 +10,18 @@ import config
 log = logging.getLogger( __name__ )
 
 
-def submit_vertex_job( job_id: str, stage: str ) -> str:
+def render_job_spec( job_id: str, stage: str ) -> tuple[ str, list[ dict ] ]:
 	'''
-	Load infra/vertex_job.yaml, substitute job_id/image_uri/stage, and submit a Vertex AI
-	CustomJob. Shared by api/routes/train.py (Stage 1, API-triggered) and
-	src/training/train.py (Stage 2, self-submitted by Stage 1's own container on success) —
-	same image, same entry point, different --stage value (train.py's own CLI arg reads
-	it), per the base/adversarial training split always starting each stage in a brand-new
-	Vertex AI-provisioned container.
+	Load infra/vertex_job.yaml, substitute job_id/image_uri/stage, and return
+	(display_name, worker_pool_specs) in Vertex AI SDK (snake_case) format — the exact
+	payload submit_vertex_job() hands to aiplatform.CustomJob, with no API call made.
+	Split out from submit_vertex_job() so scripts/validate_local.py can render and print
+	this same payload for both stage values without touching GCP, catching a
+	template-vs-submission drift locally instead of via a failed job.
 
 	stage is 'base' or 'adversarial' — train.py's --stage vocabulary, not the same as
 	JobDocument.training_stage ('base_training'/'adversarial_finetuning'/'complete'), which
 	tracks Firestore-facing progress rather than selecting a container entry point.
-
-	Returns the submitted job's Vertex AI resource name, for the caller to persist as a
-	debugging cross-reference — the Firestore job_id itself never changes across stages.
 	'''
 
 	with open( 'infra/vertex_job.yaml' ) as f:
@@ -66,6 +63,24 @@ def submit_vertex_job( job_id: str, stage: str ) -> str:
 		for pool in raw_pools
 	]
 
+	return spec[ 'displayName' ], worker_pool_specs
+
+
+def submit_vertex_job( job_id: str, stage: str ) -> str:
+	'''
+	Render infra/vertex_job.yaml via render_job_spec() and submit a Vertex AI CustomJob.
+	Shared by api/routes/train.py (Stage 1, API-triggered) and src/training/train.py
+	(Stage 2, self-submitted by Stage 1's own container on success) — same image, same
+	entry point, different --stage value (train.py's own CLI arg reads it), per the
+	base/adversarial training split always starting each stage in a brand-new
+	Vertex AI-provisioned container.
+
+	Returns the submitted job's Vertex AI resource name, for the caller to persist as a
+	debugging cross-reference — the Firestore job_id itself never changes across stages.
+	'''
+
+	display_name, worker_pool_specs = render_job_spec( job_id, stage )
+
 	# Log the literal command/args/worker_pool_specs actually being submitted (not the
 	# source YAML) — this is the payload the CustomJob API receives, so a template-vs-
 	# submission drift (e.g. a fix landing in infra/vertex_job.yaml but a stale cached
@@ -77,7 +92,7 @@ def submit_vertex_job( job_id: str, stage: str ) -> str:
 	aiplatform.init( project=config.GCP_PROJECT_ID, location=config.GCP_REGION )
 
 	custom_job = aiplatform.CustomJob(
-		display_name = spec[ 'displayName' ],
+		display_name = display_name,
 		worker_pool_specs = worker_pool_specs,
 		staging_bucket = f"gs://{ config.GCS_BUCKET }"
 	)
