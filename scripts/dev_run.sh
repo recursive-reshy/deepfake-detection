@@ -26,6 +26,8 @@ docker run --rm \
   -v "$(pwd)/src:/app/src" \
   -v "$(pwd)/api:/app/api" \
   -v "$HOME/.config/gcloud:/root/.config/gcloud:ro" \
+  -v "$(pwd)/service-account-key.json:/app/service-account-key.json:ro" \
   --env-file .env \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/app/service-account-key.json \
   "${DEV_IMAGE}" \
   uv run --frozen --no-dev "$@"
