@@ -26,5 +26,6 @@ docker run --rm \
   -v "$(pwd)/src:/app/src" \
   -v "$(pwd)/api:/app/api" \
   -v "$HOME/.config/gcloud:/root/.config/gcloud:ro" \
+  --env-file .env \
   "${DEV_IMAGE}" \
   uv run --frozen --no-dev "$@"

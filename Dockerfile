@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Base image — TensorFlow's official GPU image, not python:3.10-slim + tensorflow[and-cuda].
 # python:3.10-slim never engaged the GPU on Vertex AI: it lacks the NVIDIA Container
 # Toolkit-compatible mount points (LD_LIBRARY_PATH=/usr/local/nvidia/lib{,64},
@@ -33,11 +32,11 @@ WORKDIR /app
 ENV PYTHONPATH=/app
 
 # Install dependencies
-# Copy lockfile and project metadata first — layer caches until these change.
-# --mount=type=cache persists uv's package cache across builds in a BuildKit cache mount
-# (not a Docker layer, so it survives even when this RUN layer's cache correctly
-# invalidates on a genuine uv.lock change) — only the actual delta re-downloads rather
-# than all 545MB of TensorFlow again.
+# Copy lockfile and project metadata first — layer caches until these change. Plain
+# Docker layer caching (no BuildKit cache mount) is sufficient here: as long as nothing
+# above this line changes, this RUN layer is reused verbatim on the next build, and a
+# genuine uv.lock change is exactly when a full resync should happen.
+ENV UV_HTTP_TIMEOUT=300
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
 	uv sync --frozen --no-dev
