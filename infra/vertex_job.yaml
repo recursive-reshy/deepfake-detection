@@ -8,6 +8,11 @@ jobSpec:
         acceleratorCount: 1
       replicaCount: 1
       containerSpec:
+        # Must always resolve to image@sha256:<digest>, never a mutable tag — a tag (even
+        # one pinned to a git SHA) can still point at a stale digest if that commit is
+        # rebuilt/repushed, which is exactly what caused a prior multi-cycle debugging
+        # detour. scripts/build_and_push.sh is the single place that resolves and writes
+        # this value (to .env's IMAGE_URI) — nowhere else types or infers it.
         imageUri: {image_uri}
         command:
           - uv
@@ -22,6 +27,14 @@ jobSpec:
           - --stage
           - "{stage}"
         env:
+          # Same {image_uri} substitution as containerSpec.imageUri above, not re-derived
+          # independently — lets Stage 1's own running container read back the exact
+          # digest-pinned image it was launched from and thread that unchanged into Stage
+          # 2's self-submitted job spec (see submit_vertex_job / render_job_spec in
+          # src/utils/vertex.py). Without this, the Stage 1 container has no IMAGE_URI in
+          # its own environment at all, and Stage 2 submission fails outright.
+          - name: IMAGE_URI
+            value: {image_uri}
           - name: GCP_PROJECT_ID
             value: deepfake-detection-ct0391
           - name: GCS_BUCKET

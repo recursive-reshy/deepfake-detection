@@ -44,6 +44,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Copy application code
 COPY . .
 
+# Git SHA baked in at build time — logged at container startup by both entrypoints
+# (train.py, api/main.py) so any job/request log can directly answer "is this the code we
+# think it is". Declared here, after the uv sync layer above, since GIT_SHA changes on
+# every commit — an ARG/ENV pair placed any earlier would invalidate that expensive layer's
+# cache on every single build, for no benefit (nothing above this line depends on it).
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 # Port
 EXPOSE 8080
 

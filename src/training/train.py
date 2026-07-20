@@ -2,6 +2,7 @@
 import argparse
 import gc
 import logging
+import os
 import sys
 import tempfile
 # NumPy
@@ -44,6 +45,11 @@ handler.setFormatter( JsonFormatter(
 logging.basicConfig( level=logging.INFO, handlers=[ handler ], force=True )
 
 log = logging.getLogger( __name__ )
+
+# Git SHA (baked in at build time by the Dockerfile's GIT_SHA build arg) — logged first,
+# before any GPU/model work, so "is this the code we think it is" is answerable from this
+# job's log even if everything after this line fails.
+log.info( 'Training container started', extra={ 'git_sha': os.getenv( 'GIT_SHA', 'unknown' ) } )
 
 # GPU memory-growth configuration (fine-tuning-phase GPU-VRAM OOM amendment) — must run
 # before any other TF operation that touches a GPU device (model construction included),

@@ -1,5 +1,6 @@
 # Standard library
 import logging
+import os
 # FastAPI
 from fastapi import FastAPI
 # Structured logging
@@ -17,6 +18,13 @@ handler.setFormatter( JsonFormatter(
 	timestamp = True,
 ) )
 logging.basicConfig( level=logging.INFO, handlers=[ handler ], force=True )
+
+log = logging.getLogger( __name__ )
+
+# Git SHA (baked in at build time by the Dockerfile's GIT_SHA build arg) — logged once at
+# process startup so any Cloud Run request log can directly answer "is this the code we
+# think it is", the same check src/training/train.py does on its own startup.
+log.info( 'API container started', extra={ 'git_sha': os.getenv( 'GIT_SHA', 'unknown' ) } )
 
 app = FastAPI( title = 'Deepfake Detection API' )
 

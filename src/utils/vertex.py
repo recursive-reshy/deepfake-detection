@@ -24,12 +24,27 @@ def render_job_spec( job_id: str, stage: str ) -> tuple[ str, list[ dict ] ]:
 	tracks Firestore-facing progress rather than selecting a container entry point.
 	'''
 
+	# Fail loudly, not with a silent '' fallback — a spec submitted with an empty imageUri
+	# reaches the Vertex AI API as InvalidArgument: 400 Invalid image URI, which is a much
+	# harder failure to trace back to "IMAGE_URI wasn't set" than catching it here. This
+	# matters most for Stage 2's self-submission path (run_base_stage in
+	# src/training/train.py, calling this from inside Stage 1's own running container):
+	# that container only has IMAGE_URI in its environment because vertex_job.yaml's own
+	# containerSpec.env carries it in, via the same {image_uri} substitution as
+	# containerSpec.imageUri below — never assumed inherited from anywhere else.
+	if not config.IMAGE_URI:
+		raise RuntimeError(
+			'IMAGE_URI is not set — refusing to render a Vertex AI job spec with an empty '
+			'imageUri. Set IMAGE_URI (digest-pinned, e.g. image@sha256:...) via scripts/'
+			'build_and_push.sh before submitting a job.'
+		)
+
 	with open( 'infra/vertex_job.yaml' ) as f:
 		spec_text = f.read()
 
 	spec_text = spec_text \
 		.replace( '{job_id}', job_id ) \
-		.replace( '{image_uri}', config.IMAGE_URI or '' ) \
+		.replace( '{image_uri}', config.IMAGE_URI ) \
 		.replace( '{stage}', stage )
 
 	spec = yaml.safe_load( spec_text )
