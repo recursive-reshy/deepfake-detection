@@ -11,8 +11,8 @@ jobSpec:
         # Must always resolve to image@sha256:<digest>, never a mutable tag — a tag (even
         # one pinned to a git SHA) can still point at a stale digest if that commit is
         # rebuilt/repushed, which is exactly what caused a prior multi-cycle debugging
-        # detour. scripts/build_and_push.sh is the single place that resolves and writes
-        # this value (to .env's IMAGE_URI) — nowhere else types or infers it.
+        # detour. scripts/build_and_push.sh is the single place that resolves this digest
+        # (printed for you to copy into .env's IMAGE_URI) — nowhere else types or infers it.
         imageUri: {image_uri}
         command:
           - uv

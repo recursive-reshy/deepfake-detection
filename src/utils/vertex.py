@@ -35,8 +35,9 @@ def render_job_spec( job_id: str, stage: str ) -> tuple[ str, list[ dict ] ]:
 	if not config.IMAGE_URI:
 		raise RuntimeError(
 			'IMAGE_URI is not set — refusing to render a Vertex AI job spec with an empty '
-			'imageUri. Set IMAGE_URI (digest-pinned, e.g. image@sha256:...) via scripts/'
-			'build_and_push.sh before submitting a job.'
+			'imageUri. Run scripts/build_and_push.sh to resolve the current image digest, '
+			'then set IMAGE_URI (digest-pinned, e.g. image@sha256:...) in .env before '
+			'submitting a job.'
 		)
 
 	with open( 'infra/vertex_job.yaml' ) as f:
